@@ -94,6 +94,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'sendMessage': await this._handleSendMessage(data.value, data.model); break;
                 case 'openCloudConnect': await this._handleCloudConnection(); break;
                 case 'getModels': await this._updateModelsList(); break;
+                case 'saveModel': await this._context.workspaceState.update('lastSelectedModel', data.model); break;
                 case 'restoreHistory': webviewView.webview.postMessage({ type: 'restoreHistory', history: this._history }); break;
                 case 'createFile': if (data.value && data.target) await this._handleFileCreation(data.target, data.value); break;
                 case 'applyToActiveFile': if (data.value) await this._handleApplyEdit(data.value, data.targetFile); break;
@@ -194,7 +195,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (!this._view) return;
         try {
             const models = await this._ollamaClient.listModels();
-            this._view.webview.postMessage({ type: 'setModels', models, selected: models[0] || '' });
+            const url = vscode.workspace.getConfiguration('local-ai').get<string>('ollamaUrl') || 'http://localhost:11434';
+            const isLocal = url.includes('localhost') || url.includes('127.0.0.1');
+
+            let formattedModels = models.map(m => {
+                if (isLocal) {
+                    return { value: m, label: `💻 ${m} (⚠️ Déconseillé gros fichiers)`, isLocal: true };
+                } else {
+                    return { value: m, label: `☁️ ${m}`, isLocal: false };
+                }
+            });
+
+            const lastSelected = this._context.workspaceState.get<string>('lastSelectedModel');
+            let selected = models[0] || '';
+            if (lastSelected && models.includes(lastSelected)) {
+                selected = lastSelected;
+            }
+
+            this._view.webview.postMessage({ type: 'setModels', models: formattedModels, selected });
         } catch { this._view.webview.postMessage({ type: 'setModels', models: [] }); }
     }
 
@@ -285,7 +303,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return `<!DOCTYPE html><html><head><meta charset="UTF-8">
         <style>
             body { font-family: 'Inter', sans-serif; background: #000; color: #fff; margin:0; height:100vh; display:flex; flex-direction:column; overflow:hidden; }
-            .space-bg { position:fixed; top:0; left:0; width:100%; height:100%; background: url('${bgUri}'); background-size:cover; filter:brightness(0.4); z-index:-1; }
+            .space-bg { position:fixed; top:0; left:0; width:100%; height:100%; background: url('${bgUri}') no-repeat center center; background-size:cover; filter:brightness(0.4); z-index:-1; }
             .header { padding:8px; background:rgba(0,0,0,0.8); display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #333; }
             #chat { flex:1; overflow-y:auto; padding:15px; display:flex; flex-direction:column; gap:10px; }
             .msg { padding:10px; border-radius:8px; border:1px solid #333; max-width:90%; line-height:1.5; }
@@ -321,7 +339,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
                 window.addEventListener('message', e => {
                     const m = e.data;
-                    if(m.type === 'setModels') modelSelect.innerHTML = m.models.map(x => '<option value="'+x+'">'+x+'</option>').join('');
+                    if(m.type === 'setModels') {
+                        modelSelect.innerHTML = m.models.map(x => {
+                            const color = x.isLocal ? '#b19cd9' : '#00d2ff'; // Purple for local, Blue for cloud
+                            const isSelected = x.value === m.selected ? 'selected' : '';
+                            return '<option value="'+x.value+'" style="color: '+color+';" '+isSelected+'>'+x.label+'</option>';
+                        }).join('');
+                        
+                        // Force update select color based on current selected option
+                        const updateSelectColor = () => {
+                            const selectedOption = modelSelect.options[modelSelect.selectedIndex];
+                            if (selectedOption) {
+                                modelSelect.style.color = selectedOption.style.color;
+                                modelSelect.style.borderColor = selectedOption.style.color;
+                            }
+                        };
+                        modelSelect.onchange = () => {
+                            updateSelectColor();
+                            vscode.postMessage({ type: 'saveModel', model: modelSelect.value });
+                        };
+                        updateSelectColor(); // Initial call
+                    }
                     if(m.type === 'endResponse') add(m.value, 'ai');
                     if(m.type === 'injectMessage') { prompt.value = m.value; prompt.focus(); }
                 });
