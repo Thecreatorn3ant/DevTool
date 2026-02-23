@@ -52,6 +52,11 @@
                     "type": "string",
                     "default": "llama3",
                     "description": "The default model to use for completion and chat."
+                },
+                "local-ai.apiKey": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Optional API Key (Bearer Token) for authenticating to cloud models (e.g. Ollama Cloud, OpenRouter, Together AI)."
                 }
             }
         }

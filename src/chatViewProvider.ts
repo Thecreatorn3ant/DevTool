@@ -88,6 +88,51 @@ function applySearchReplace(
             continue;
         }
 
+        const fuzzySearchLines = search.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        const workingLines = workingText.split('\n');
+        let fuzzyMatched = false;
+
+        if (fuzzySearchLines.length > 0) {
+            for (let i = 0; i < workingLines.length; i++) {
+                let match = true;
+                let searchIdx = 0;
+                let docIdx = i;
+
+                while (searchIdx < fuzzySearchLines.length && docIdx < workingLines.length) {
+                    const docLine = workingLines[docIdx].trim();
+                    if (docLine === '') {
+                        docIdx++;
+                        continue;
+                    }
+                    if (docLine !== fuzzySearchLines[searchIdx]) {
+                        match = false;
+                        break;
+                    }
+                    searchIdx++;
+                    docIdx++;
+                }
+
+                if (match && searchIdx === fuzzySearchLines.length) {
+                    const textToReplace = workingLines.slice(i, docIdx).join('\n');
+
+                    const occurrencesFuzzy = workingText.split(textToReplace).length - 1;
+                    if (occurrencesFuzzy === 1) {
+                        workingText = workingText.replace(textToReplace, replace);
+                        patchCount++;
+                        fuzzyMatched = true;
+                    } else if (occurrencesFuzzy > 1) {
+                        errors.push(`Bloc SEARCH ambigu en fuzzy-match (${occurrencesFuzzy} occurrences) — ignoré.`);
+                        fuzzyMatched = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (fuzzyMatched) {
+            continue;
+        }
+
         const occurrences = workingText.split(search).length - 1;
         if (occurrences > 1) {
             errors.push(`Bloc SEARCH ambigu (${occurrences} occurrences) — ignoré.`);

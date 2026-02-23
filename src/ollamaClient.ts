@@ -46,6 +46,29 @@ Règles absolues de parsage :
 3. Le bloc SEARCH doit être un copié-collé STRICT du code actuel. Ne résume jamais avec des "...".
 4. Ne réécris pas tout le fichier, limite-toi au fragment exact.
 
+━━━ EXEMPLE DE BONNE RÉPONSE (À IMITER ABSOLUMENT) ━━━
+Utilisateur: ajoute un log d'erreur dans le catch
+
+Réponse attendue (sans aucun autre texte) :
+\`\`\`typescript
+<<<< SEARCH
+        try {
+            await this.db.connect();
+            this.isConnected = true;
+        } catch (e) {
+            this.isConnected = false;
+        }
+====
+        try {
+            await this.db.connect();
+            this.isConnected = true;
+        } catch (e) {
+            console.error("Erreur :", e);
+            this.isConnected = false;
+        }
+>>>>
+\`\`\`
+
 ━━━ NOUVEAU FICHIER ━━━
 [FILE: chemin/fichier.ext]
 \`\`\`
@@ -59,10 +82,28 @@ code
             ? `Contexte du projet:\n${context}\n\n---\nQuestion: ${prompt}`
             : prompt;
 
+        let apiKey = config.get<string>('apiKey') || '';
+
+        if (apiKey.startsWith('http') && apiKey.includes('key=')) {
+            try {
+                const urlObj = new URL(apiKey);
+                const extractedKey = urlObj.searchParams.get('key');
+                if (extractedKey) {
+                    apiKey = extractedKey;
+                }
+            } catch (e) {
+            }
+        }
+
         try {
+            const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+            if (apiKey) {
+                headers['Authorization'] = `Bearer ${apiKey}`;
+            }
+
             const response = await fetch(`${url}/api/generate`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers,
                 body: JSON.stringify({
                     model,
                     prompt: fullPrompt,
