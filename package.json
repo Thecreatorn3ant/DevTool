@@ -1,0 +1,79 @@
+{
+    "name": "local-ai-integration",
+    "displayName": "Local AI Integration",
+    "description": "Integrate local AI models (Ollama) into VS Code with project context.",
+    "version": "0.0.1",
+    "publisher": "antigravity",
+    "icon": "media/icon.png",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "AI",
+        "Programming Languages"
+    ],
+    "main": "./out/extension.js",
+    "contributes": {
+        "commands": [
+            {
+                "command": "local-ai.openChat",
+                "title": "Local AI: Open Chat",
+                "category": "Local AI"
+            }
+        ],
+        "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "local-ai-sidebar",
+                    "title": "Local AI",
+                    "icon": "media/icon.svg"
+                }
+            ]
+        },
+        "views": {
+            "local-ai-sidebar": [
+                {
+                    "type": "webview",
+                    "id": "local-ai.chatView",
+                    "name": "Chat",
+                    "icon": "media/icon.svg"
+                }
+            ]
+        },
+        "configuration": {
+            "title": "Local AI",
+            "properties": {
+                "local-ai.ollamaUrl": {
+                    "type": "string",
+                    "default": "http://localhost:11434",
+                    "description": "The URL of your local Ollama server."
+                },
+                "local-ai.defaultModel": {
+                    "type": "string",
+                    "default": "llama3",
+                    "description": "The default model to use for completion and chat."
+                }
+            }
+        }
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./",
+        "pretest": "npm run compile && npm run lint",
+        "lint": "eslint src --ext ts",
+        "test": "node ./out/test/runTest.js"
+    },
+    "devDependencies": {
+        "@types/vscode": "^1.85.0",
+        "@types/mocha": "^10.0.6",
+        "@types/node": "18.x",
+        "@typescript-eslint/eslint-plugin": "^6.13.1",
+        "@typescript-eslint/parser": "^6.13.1",
+        "eslint": "^8.54.0",
+        "glob": "^10.3.10",
+        "mocha": "^10.2.0",
+        "typescript": "^5.3.2",
+        "@vscode/test-electron": "^2.3.8"
+    }
+}
