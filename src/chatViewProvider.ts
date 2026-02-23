@@ -26,9 +26,9 @@ function applySearchReplace(
     let searchLines: string[] = [];
     let replaceLines: string[] = [];
 
-    const isSearchMarker = (l: string) => /^<{2,}\s*SEARCH/.test(l.trim());
-    const isSeparator = (l: string) => /^={2,}\s*$/.test(l.trim());
-    const isCloseMarker = (l: string) => /^>{2,}/.test(l.trim());
+    const isSearchMarker = (l: string) => /^\s*<{2,}\s*SEARCH/i.test(l);
+    const isSeparator = (l: string) => /^\s*={2,}\s*$/.test(l);
+    const isCloseMarker = (l: string) => /^\s*>{2,}/.test(l);
 
     for (const line of lines) {
         if (state === 'idle') {
@@ -333,7 +333,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const document = await vscode.workspace.openTextDocument(targetUri);
         const documentText = document.getText();
 
-        const hasMarkers = /^<{2,}\s*SEARCH/m.test(codeContent.replace(/\r\n/g, '\n'));
+        const hasMarkers = /^\s*<{2,}\s*SEARCH/im.test(codeContent.replace(/\r\n/g, '\n'));
 
         let previewText = codeContent;
         let patchCount = 0;
