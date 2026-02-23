@@ -321,67 +321,70 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async _handleCloudConnection() {
-        const modeChoice = await vscode.window.showQuickPick(
-            [
-                { label: '💻 Revenir en Local', description: 'Ollama local (http://localhost:11434)' },
-                { label: '🚀 Cloud : Together AI', description: 'Obtenir une clé API gratuite et modèles super rapides' },
-                { label: '🌌 Cloud : OpenRouter', description: 'Accès à tous les modèles AI du monde' },
-                { label: '⚙️ Ollama Distant Custom', description: 'Un serveur Ollama distant privé' }
-            ],
-            { placeHolder: 'Choisissez le fournisseur d\'Intelligence Artificielle' }
-        );
+        vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: "Recherche de modèles IA...",
+            cancellable: false
+        }, async (progress) => {
+            const models = await this._ollamaClient.listModels();
+            if (models.length > 0) {
+                vscode.window.showInformationMessage(`✅ ${models.length} modèles détectés ! Vous êtes déjà connecté.`);
+                this._updateModelsList();
+                return;
+            }
 
-        if (!modeChoice) return;
+            const modeChoice = await vscode.window.showQuickPick(
+                [
+                    { label: '💻 Revenir en Local', description: 'Ollama standard (http://localhost:11434)' },
+                    { label: '🚀 Cloud Direct : Together / OpenRouter', description: 'Le plus puissant. Sans Ollama. (Nécessite une clé API)' },
+                    { label: '☁️ Aide : Ollama Cloud / n3-coder', description: 'Comment utiliser votre lien "ollama.com/connect"' },
+                    { label: '⚙️ Configurer manuellement', description: 'Entrer une URL et une Clé API personnalisée' }
+                ],
+                { placeHolder: 'La connexion a échoué. Comment voulez-vous procéder ?' }
+            );
 
-        const config = vscode.workspace.getConfiguration('local-ai');
+            if (!modeChoice) return;
 
-        if (modeChoice.label.includes('Local')) {
-            await config.update('ollamaUrl', 'http://localhost:11434', true);
-            await config.update('apiKey', '', true);
-            vscode.window.showInformationMessage("💻 Retour en mode Local. Modèles locaux rechargés.");
-            this._updateModelsList();
-            return;
-        }
+            const config = vscode.workspace.getConfiguration('local-ai');
 
-        let finalUrl = '';
-        let promptText = '';
-        let placeHolder = '';
-
-        if (modeChoice.label.includes('Together AI')) {
-            vscode.env.openExternal(vscode.Uri.parse('https://api.together.xyz/settings/api-keys'));
-            finalUrl = "https://api.together.xyz/v1";
-            promptText = "Collez ici votre clé API Together AI (obtenue sur la page web ouverte)";
-            placeHolder = "sk-...";
-        } else if (modeChoice.label.includes('OpenRouter')) {
-            vscode.env.openExternal(vscode.Uri.parse('https://openrouter.ai/keys'));
-            finalUrl = "https://openrouter.ai/api/v1";
-            promptText = "Collez ici votre clé API OpenRouter (obtenue sur la page web ouverte)";
-            placeHolder = "sk-or-v1-...";
-        } else if (modeChoice.label.includes('Custom')) {
-            const urlInput = await vscode.window.showInputBox({
-                prompt: "URL distante de votre serveur Ollama",
-                placeHolder: "ex: http://vps-ip:11434",
-                ignoreFocusOut: true
-            });
-            if (!urlInput) return;
-            finalUrl = urlInput;
-            promptText = "Clé API (Optionnel, appuyez sur Entrée si aucune)";
-        }
-
-        const apiKeyInput = await vscode.window.showInputBox({
-            prompt: promptText,
-            placeHolder: placeHolder || "Laissez vide si pas de clé",
-            password: true,
-            ignoreFocusOut: true
+            if (modeChoice.label.includes('Local')) {
+                await config.update('ollamaUrl', 'http://localhost:11434', true);
+                await config.update('apiKey', '', true);
+                vscode.window.showInformationMessage("💻 Mode Local activé.");
+                this._updateModelsList();
+            } else if (modeChoice.label.includes('Cloud Direct')) {
+                const subChoice = await vscode.window.showQuickPick(['Together AI', 'OpenRouter'], { placeHolder: 'Choisissez votre fournisseur Cloud' });
+                if (subChoice === 'Together AI') {
+                    vscode.env.openExternal(vscode.Uri.parse('https://api.together.xyz/settings/api-keys'));
+                    const key = await vscode.window.showInputBox({ prompt: "Collez votre clé Together AI", password: true });
+                    if (key) {
+                        await config.update('ollamaUrl', 'https://api.together.xyz/v1', true);
+                        await config.update('apiKey', key, true);
+                    }
+                } else if (subChoice === 'OpenRouter') {
+                    vscode.env.openExternal(vscode.Uri.parse('https://openrouter.ai/keys'));
+                    const key = await vscode.window.showInputBox({ prompt: "Collez votre clé OpenRouter", password: true });
+                    if (key) {
+                        await config.update('ollamaUrl', 'https://openrouter.ai/api/v1', true);
+                        await config.update('apiKey', key, true);
+                    }
+                }
+                this._updateModelsList();
+            } else if (modeChoice.label.includes('Aide : Ollama Cloud')) {
+                vscode.window.showInformationMessage(
+                    "💡 Pour utiliser le Cloud n3-coder, vous devez d'abord exécuter la commande dans votre terminal Windows.\n\n1. Copiez votre lien : ollama.com/connect?key=...\n2. Ouvrez un terminal et collez-le.\n3. Une fois fait, revenez ici en mode 'Local'.",
+                    { modal: true }
+                );
+            } else if (modeChoice.label.includes('manuellement')) {
+                const urlInput = await vscode.window.showInputBox({ prompt: "URL (ex: http://vps-ip:11434)", ignoreFocusOut: true });
+                if (urlInput) {
+                    const keyInput = await vscode.window.showInputBox({ prompt: "Clé API (Optionnelle)", password: true });
+                    await config.update('ollamaUrl', urlInput, true);
+                    await config.update('apiKey', keyInput || '', true);
+                    this._updateModelsList();
+                }
+            }
         });
-
-        if (apiKeyInput === undefined) return;
-
-        await config.update('ollamaUrl', finalUrl, true);
-        await config.update('apiKey', apiKeyInput, true);
-
-        vscode.window.showInformationMessage(`✅ Configuration ${modeChoice.label.split(':')[0]} enregistrée ! Récupération des modèles...`);
-        this._updateModelsList();
     }
 
     private _updateHistory() {
