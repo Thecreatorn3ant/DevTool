@@ -312,6 +312,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             input { flex:1; background:#000; color:#fff; border:1px solid #444; padding:8px; border-radius:6px; outline:none; }
             button { background:#007acc; color:#fff; border:none; padding:8px 15px; border-radius:6px; cursor:pointer; font-weight:bold; }
             select { background:#111; color:#00d2ff; border:1px solid #333; font-size:11px; padding:3px; }
+            .code-block { background:#1e1e1e; border:1px solid #444; border-radius:6px; margin:10px 0; overflow:hidden; text-align:left; }
+            .code-header { background:#2d2d2d; padding:6px 10px; display:flex; justify-content:space-between; align-items:center; font-size:11px; color:#aaa; }
+            .code-header button { padding:4px 8px; font-size:11px; background:#007acc; border-radius:4px; margin-left:10px; }
+            .code-content { padding:10px; font-family:'Consolas', monospace; font-size:12px; color:#d4d4d4; white-space:pre-wrap; max-height:400px; overflow-y:auto; }
+            .code-block.patch { border-color:#007acc; }
+            .code-block.patch .code-header { background: rgba(0, 122, 204, 0.2); color:#fff; }
         </style></head>
         <body><div class="space-bg"></div>
             <div class="header">
@@ -336,7 +342,52 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 const send = document.getElementById('send');
                 const modelSelect = document.getElementById('modelSelect');
 
-                const add = (txt, cls) => { const d = document.createElement('div'); d.className = 'msg ' + cls; d.innerText = txt; chat.appendChild(d); chat.scrollTop = chat.scrollHeight; return d; };
+                const add = (txt, cls, isHtml = false) => { 
+                    const d = document.createElement('div'); 
+                    d.className = 'msg ' + cls; 
+                    if(isHtml) d.innerHTML = txt; else d.innerText = txt; 
+                    chat.appendChild(d); 
+                    chat.scrollTop = chat.scrollHeight; 
+                    return d; 
+                };
+
+                const renderMarkdown = (text) => {
+                    let t = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    const blocks = [];
+                    // Replace code blocks
+                    t = t.replace(/\`\`\`(.*?)\\n([\\s\\S]*?)\`\`\`/g, (match, lang, inner) => {
+                        const raw = inner.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+                        const isPatch = raw.includes('SEARCH') || raw.includes('=======');
+                        const encMatch = encodeURIComponent(match.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'));
+                        
+                        let blockHtml = '';
+                        if (isPatch) {
+                            blockHtml = '<div class="code-block patch">' +
+                                '<div class="code-header"><span>🛠️ Proposition de modification</span><button onclick="vscode.postMessage({type:\\'applyToActiveFile\\', value: decodeURIComponent(\\''+encMatch+'\\')})">Appliquer direct ✅</button></div>' +
+                                '<div class="code-content">' + inner + '</div></div>';
+                        } else {
+                            const rawEnc = encodeURIComponent(raw);
+                            blockHtml = '<div class="code-block">' +
+                                '<div class="code-header"><span>📄 Code ' + lang + '</span><button onclick="vscode.postMessage({type:\\'createFile\\', value: decodeURIComponent(\\''+rawEnc+'\\'), target: \\'nouveau.ts\\'})">Créer fichier</button></div>' +
+                                '<div class="code-content">' + inner + '</div></div>';
+                        }
+                        blocks.push(blockHtml);
+                        return '%%%BLOCK_'+(blocks.length-1)+'%%%';
+                    });
+
+                    // Format text
+                    t = t.replace(/\\*\\*(.*?)\\*\\*/g, '<b>$1</b>');
+                    t = t.replace(/\\*(.*?)\\*/g, '<i>$1</i>');
+                    t = t.replace(/\`([^\`]+)\`/g, '<code style="background:#333;color:#00d2ff;padding:2px 4px;border-radius:3px;font-family:monospace;">$1</code>');
+                    t = t.replace(/\\n/g, '<br/>');
+
+                    // Inject blocks back
+                    t = t.replace(/%%%BLOCK_(\\d+)%%%/g, (match, idx) => blocks[parseInt(idx)] || '');
+                    return t;
+                };
+
+                let currentAiMsg = null;
+                let currentAiText = '';
 
                 send.onclick = () => { 
                     const v = prompt.value; 
@@ -362,7 +413,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             return '<option value="'+x.value+'" data-name="'+x.name+'" data-url="'+x.url+'" style="color: '+color+';" '+isSelected+'>'+x.label+'</option>';
                         }).join('');
                         
-                        // Force update select color based on current selected option
                         const updateSelectColor = () => {
                             const selectedOption = modelSelect.options[modelSelect.selectedIndex];
                             if (selectedOption) {
@@ -377,9 +427,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             updateSelectColor();
                             vscode.postMessage({ type: 'saveModel', model: modelSelect.value });
                         };
-                        updateSelectColor(); // Initial call
+                        updateSelectColor();
                     }
-                    if(m.type === 'endResponse') add(m.value, 'ai');
+                    if(m.type === 'startResponse') {
+                        currentAiMsg = add('', 'ai', true);
+                        currentAiText = '';
+                    }
+                    if(m.type === 'partialResponse') {
+                        if(!currentAiMsg) currentAiMsg = add('', 'ai', true);
+                        currentAiText += m.value;
+                        currentAiMsg.innerHTML = renderMarkdown(currentAiText);
+                        chat.scrollTop = chat.scrollHeight;
+                    }
+                    if(m.type === 'endResponse') {
+                        if(currentAiMsg) {
+                            currentAiMsg.innerHTML = renderMarkdown(m.value);
+                            currentAiMsg = null;
+                        } else {
+                            add(renderMarkdown(m.value), 'ai', true);
+                        }
+                        currentAiText = '';
+                    }
                     if(m.type === 'injectMessage') { prompt.value = m.value; prompt.focus(); }
                 });
                 vscode.postMessage({ type: 'getModels' });
