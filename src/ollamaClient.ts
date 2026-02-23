@@ -57,9 +57,10 @@ export class OllamaClient {
         prompt: string,
         context: string,
         onUpdate: (chunk: string) => void,
-        modelOverride?: string
+        modelOverride?: string,
+        targetUrl?: string
     ): Promise<string> {
-        const url = this._getBaseUrl();
+        const url = targetUrl || this._getBaseUrl();
         const config = this._getConfig();
         const model = modelOverride || config.get<string>('defaultModel') || 'llama3';
 
@@ -220,9 +221,9 @@ Règles :
 2. Inclure 2 lignes de contexte avant et après.`;
     }
 
-    async generateResponse(prompt: string, context: string = '', modelOverride?: string): Promise<string> {
+    async generateResponse(prompt: string, context: string = '', modelOverride?: string, targetUrl?: string): Promise<string> {
         let full = '';
-        return await this.generateStreamingResponse(prompt, context, (c) => { full += c; }, modelOverride);
+        return await this.generateStreamingResponse(prompt, context, (c) => { full += c; }, modelOverride, targetUrl);
     }
 
     private _isOpenAI(url: string): boolean {
@@ -247,6 +248,44 @@ Règles :
                 return (data?.models || []).map((m: any) => m.name).filter(Boolean);
             }
         } catch { return []; }
+    }
+
+    async listAllModels(): Promise<{ name: string, isLocal: boolean, url: string }[]> {
+        const activeUrl = this._getBaseUrl();
+        const config = this._getConfig();
+        const result: { name: string, isLocal: boolean, url: string }[] = [];
+
+        let localModels: string[] = [];
+        try {
+            const res = await fetch('http://localhost:11434/api/tags', { signal: AbortSignal.timeout(2000) });
+            if (res.ok) {
+                const data: any = await res.json();
+                localModels = (data?.models || []).map((m: any) => m.name).filter(Boolean);
+            }
+        } catch { }
+
+        let cloudModels: string[] = [];
+        if (!activeUrl.includes('localhost') && !activeUrl.includes('127.0.0.1')) {
+            try {
+                const apiKey = this._getAvailableKey(activeUrl);
+                const headers: Record<string, string> = {};
+                if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+                const isOpenAI = this._isOpenAI(activeUrl);
+                const endpoint = isOpenAI ? `${activeUrl}/models` : `${activeUrl}/api/tags`;
+                const res = await fetch(endpoint, { headers, signal: AbortSignal.timeout(4000) });
+                if (res.ok) {
+                    const data: any = await res.json();
+                    cloudModels = isOpenAI
+                        ? (data?.data || []).map((m: any) => m.id).filter(Boolean)
+                        : (data?.models || []).map((m: any) => m.name).filter(Boolean);
+                }
+            } catch { }
+        }
+
+        for (const m of cloudModels) result.push({ name: m, isLocal: false, url: activeUrl });
+        for (const m of localModels) result.push({ name: m, isLocal: true, url: 'http://localhost:11434' });
+
+        return result;
     }
 
     async checkConnection(): Promise<boolean> {

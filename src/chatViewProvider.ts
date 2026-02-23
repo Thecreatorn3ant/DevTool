@@ -91,7 +91,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {
-                case 'sendMessage': await this._handleSendMessage(data.value, data.model); break;
+                case 'sendMessage': await this._handleSendMessage(data.value, data.model, data.url); break;
                 case 'openCloudConnect': await this._handleCloudConnection(); break;
                 case 'getModels': await this._updateModelsList(); break;
                 case 'saveModel': await this._context.workspaceState.update('lastSelectedModel', data.model); break;
@@ -112,7 +112,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async _handleSendMessage(userMsg: string, model?: string) {
+    private async _handleSendMessage(userMsg: string, model?: string, targetUrl?: string) {
         if (!userMsg || !this._view) return;
         this._history.push({ role: 'user', value: userMsg });
         this._updateHistory();
@@ -137,7 +137,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             const response = await this._ollamaClient.generateStreamingResponse(userMsg, fullContext, (chunk) => {
                 fullRes += chunk;
                 this._view?.webview.postMessage({ type: 'partialResponse', value: chunk });
-            }, model);
+            }, model, targetUrl);
             this._history.push({ role: 'ai', value: response });
             this._updateHistory();
             this._view.webview.postMessage({ type: 'endResponse', value: response });
@@ -194,21 +194,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private async _updateModelsList() {
         if (!this._view) return;
         try {
-            const models = await this._ollamaClient.listModels();
-            const url = vscode.workspace.getConfiguration('local-ai').get<string>('ollamaUrl') || 'http://localhost:11434';
-            const isLocal = url.includes('localhost') || url.includes('127.0.0.1');
+            const models = await this._ollamaClient.listAllModels();
 
             let formattedModels = models.map(m => {
-                if (isLocal) {
-                    return { value: m, label: `💻 ${m} (⚠️ Déconseillé gros fichiers)`, isLocal: true };
+                if (m.isLocal) {
+                    return { value: m.name, url: m.url, label: `💻 ${m.name} (⚠️ Déconseillé gros fichiers)`, isLocal: true };
                 } else {
-                    return { value: m, label: `☁️ ${m}`, isLocal: false };
+                    return { value: m.name, url: m.url, label: `☁️ ${m.name}`, isLocal: false };
                 }
             });
 
             const lastSelected = this._context.workspaceState.get<string>('lastSelectedModel');
-            let selected = models[0] || '';
-            if (lastSelected && models.includes(lastSelected)) {
+            let selected = formattedModels.length > 0 ? formattedModels[0].value : '';
+            if (lastSelected && formattedModels.find(m => m.value === lastSelected)) {
                 selected = lastSelected;
             }
 
@@ -333,7 +331,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
                 const add = (txt, cls) => { const d = document.createElement('div'); d.className = 'msg ' + cls; d.innerText = txt; chat.appendChild(d); chat.scrollTop = chat.scrollHeight; return d; };
 
-                send.onclick = () => { const v = prompt.value; if(!v) return; add(v, 'user'); vscode.postMessage({ type: 'sendMessage', value: v, model: modelSelect.value }); prompt.value=''; };
+                send.onclick = () => { 
+                    const v = prompt.value; 
+                    if(!v) return; 
+                    add(v, 'user'); 
+                    
+                    const opt = modelSelect.options[modelSelect.selectedIndex];
+                    const url = opt ? opt.getAttribute('data-url') : '';
+                    
+                    vscode.postMessage({ type: 'sendMessage', value: v, model: modelSelect.value, url }); 
+                    prompt.value=''; 
+                };
                 prompt.onkeydown = e => { if(e.key === 'Enter') send.onclick(); };
                 document.getElementById('btnCloud').onclick = () => vscode.postMessage({ type: 'openCloudConnect' });
 
@@ -343,7 +351,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         modelSelect.innerHTML = m.models.map(x => {
                             const color = x.isLocal ? '#b19cd9' : '#00d2ff'; // Purple for local, Blue for cloud
                             const isSelected = x.value === m.selected ? 'selected' : '';
-                            return '<option value="'+x.value+'" style="color: '+color+';" '+isSelected+'>'+x.label+'</option>';
+                            return '<option value="'+x.value+'" data-url="'+x.url+'" style="color: '+color+';" '+isSelected+'>'+x.label+'</option>';
                         }).join('');
                         
                         // Force update select color based on current selected option
