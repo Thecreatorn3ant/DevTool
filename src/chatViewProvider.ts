@@ -333,7 +333,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const document = await vscode.workspace.openTextDocument(targetUri);
         const documentText = document.getText();
 
-        const hasMarkers = /^<{2,}\s*SEARCH\s*$/m.test(codeContent.replace(/\r\n/g, '\n'));
+        const hasMarkers = /^<{2,}\s*SEARCH/m.test(codeContent.replace(/\r\n/g, '\n'));
 
         let previewText = codeContent;
         let patchCount = 0;
@@ -386,12 +386,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         try {
-            if (!result || result.includes("Rejeter")) {
+            if (!result || result.includes("Rejeter") || result.includes("Annuler")) {
             } else if (result.includes("Insérer au curseur")) {
                 const editor = await vscode.window.showTextDocument(document);
-                await editor.edit(eb => eb.insert(editor.selection.active, codeContent));
+                const insertPos = editor.selection.active;
+                await editor.edit(eb => eb.insert(insertPos, codeContent));
+                this._highlightLines(editor, insertPos.line, insertPos.line + codeContent.split('\n').length - 1);
                 vscode.window.showInformationMessage("Snippet inséré !");
             } else if (result.includes("Accepter")) {
+                const oldText = document.getText();
                 const edit = new vscode.WorkspaceEdit();
                 const fullRange = new vscode.Range(
                     document.lineAt(0).range.start,
@@ -400,8 +403,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 edit.replace(document.uri, fullRange, previewText);
                 await vscode.workspace.applyEdit(edit);
                 await document.save();
+                const editor = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === document.uri.toString());
+                if (editor) { this._highlightChangedLines(editor, oldText, previewText); }
                 vscode.window.showInformationMessage(`✅ Patch appliqué (${patchCount} bloc(s)) et sauvegardé !`);
             } else {
+                const oldText = document.getText();
                 const edit = new vscode.WorkspaceEdit();
                 const fullRange = new vscode.Range(
                     document.lineAt(0).range.start,
@@ -410,6 +416,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 edit.replace(document.uri, fullRange, codeContent);
                 await vscode.workspace.applyEdit(edit);
                 await document.save();
+                const editor = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === document.uri.toString());
+                if (editor) { this._highlightChangedLines(editor, oldText, codeContent); }
                 vscode.window.showInformationMessage("🔄 Fichier remplacé et sauvegardé !");
             }
         } finally {
@@ -436,6 +444,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return files
             .map(uri => vscode.workspace.asRelativePath(uri))
             .sort();
+    }
+
+    private _highlightLines(editor: vscode.TextEditor, startLine: number, endLine: number) {
+        const decType = vscode.window.createTextEditorDecorationType({
+            backgroundColor: 'rgba(0, 255, 120, 0.18)',
+            isWholeLine: true,
+            overviewRulerColor: 'rgba(0, 255, 120, 0.6)',
+            overviewRulerLane: vscode.OverviewRulerLane.Right,
+        });
+        const ranges: vscode.Range[] = [];
+        for (let i = startLine; i <= Math.min(endLine, editor.document.lineCount - 1); i++) {
+            ranges.push(editor.document.lineAt(i).range);
+        }
+        editor.setDecorations(decType, ranges);
+        setTimeout(() => decType.dispose(), 4000);
+    }
+
+    private _highlightChangedLines(editor: vscode.TextEditor, oldText: string, newText: string) {
+        const oldLines = oldText.replace(/\r\n/g, '\n').split('\n');
+        const newLines = newText.replace(/\r\n/g, '\n').split('\n');
+        const changedLineNums: number[] = [];
+        const maxLen = newLines.length;
+        for (let i = 0; i < maxLen; i++) {
+            if (newLines[i] !== oldLines[i]) {
+                changedLineNums.push(i);
+            }
+        }
+        if (changedLineNums.length === 0) { return; }
+        const decType = vscode.window.createTextEditorDecorationType({
+            backgroundColor: 'rgba(0, 255, 120, 0.18)',
+            isWholeLine: true,
+            overviewRulerColor: 'rgba(0, 255, 120, 0.6)',
+            overviewRulerLane: vscode.OverviewRulerLane.Right,
+            after: { contentText: ' ✎ modifié par IA', color: 'rgba(0, 255, 120, 0.5)', fontStyle: 'italic', margin: '0 0 0 12px' }
+        });
+        const ranges = changedLineNums
+            .filter(n => n < editor.document.lineCount)
+            .map(n => editor.document.lineAt(n).range);
+        editor.setDecorations(decType, ranges);
+        setTimeout(() => decType.dispose(), 5000);
     }
 
     private async _handleRunCommand(command: string) {
