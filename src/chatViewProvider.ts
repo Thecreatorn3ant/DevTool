@@ -143,7 +143,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     if (editor) {
                         const doc = editor.document;
                         const relativeName = vscode.workspace.asRelativePath(doc.fileName);
-                        activeContext = `Fichier actif: ${relativeName}\nContenu:\n${doc.getText()}`;
+                        const fullText = doc.getText();
+                        const MAX_CHARS = 12000;
+                        const truncated = fullText.length > MAX_CHARS;
+                        const snippet = truncated
+                            ? fullText.substring(0, MAX_CHARS) + `\n\n[... fichier tronqué à ${MAX_CHARS} caractères sur ${fullText.length} total ...]`
+                            : fullText;
+                        activeContext = `Fichier actif: ${relativeName}\nContenu:\n${snippet}`;
                     }
 
                     let fullContext = '';
@@ -601,12 +607,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "            case 'partialResponse':",
             "                if (currentAiDiv) {",
             "                    currentAiText += m.value;",
-            "                    renderMsgContent(currentAiDiv, currentAiText, 'ai');",
+            "                    if (!currentAiDiv._streamEl) {",
+            "                        currentAiDiv.innerHTML = '';",
+            "                        var streamPre = document.createElement('pre');",
+            "                        streamPre.style.cssText = 'white-space:pre-wrap;word-break:break-word;margin:0;font-family:inherit;font-size:inherit;color:inherit;';",
+            "                        currentAiDiv._streamEl = streamPre;",
+            "                        currentAiDiv.appendChild(streamPre);",
+            "                    }",
+            "                    currentAiDiv._streamEl.textContent = currentAiText;",
             "                    chat.scrollTop = chat.scrollHeight;",
             "                }",
             "                break;",
             "            case 'endResponse':",
-            "                if (currentAiDiv && m.value) { renderMsgContent(currentAiDiv, m.value, 'ai'); }",
+            "                if (currentAiDiv) { currentAiDiv._streamEl = null; if (m.value) { renderMsgContent(currentAiDiv, m.value, 'ai'); } }",
             "                currentAiDiv = null; currentAiText = ''; setWaiting(false);",
             "                break;",
             "            case 'setModels':",
