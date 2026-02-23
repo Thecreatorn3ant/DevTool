@@ -197,10 +197,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             const models = await this._ollamaClient.listAllModels();
 
             let formattedModels = models.map(m => {
+                const uniqueValue = (m.isLocal ? 'local|' : 'cloud|') + m.name;
                 if (m.isLocal) {
-                    return { value: m.name, url: m.url, label: `💻 ${m.name}`, isLocal: true };
+                    return { value: uniqueValue, name: m.name, url: m.url, label: `💻 ${m.name}`, isLocal: true };
                 } else {
-                    return { value: m.name, url: m.url, label: `☁️ ${m.name}`, isLocal: false };
+                    return { value: uniqueValue, name: m.name, url: m.url, label: `☁️ ${m.name}`, isLocal: false };
                 }
             });
 
@@ -344,8 +345,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     
                     const opt = modelSelect.options[modelSelect.selectedIndex];
                     const url = opt ? opt.getAttribute('data-url') : '';
+                    const actualModel = opt ? opt.getAttribute('data-name') : '';
                     
-                    vscode.postMessage({ type: 'sendMessage', value: v, model: modelSelect.value, url }); 
+                    vscode.postMessage({ type: 'sendMessage', value: v, model: actualModel, url }); 
                     prompt.value=''; 
                 };
                 prompt.onkeydown = e => { if(e.key === 'Enter') send.onclick(); };
@@ -357,7 +359,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         modelSelect.innerHTML = m.models.map(x => {
                             const color = x.isLocal ? '#b19cd9' : '#00d2ff'; // Purple for local, Blue for cloud
                             const isSelected = x.value === m.selected ? 'selected' : '';
-                            return '<option value="'+x.value+'" data-url="'+x.url+'" style="color: '+color+';" '+isSelected+'>'+x.label+'</option>';
+                            return '<option value="'+x.value+'" data-name="'+x.name+'" data-url="'+x.url+'" style="color: '+color+';" '+isSelected+'>'+x.label+'</option>';
                         }).join('');
                         
                         // Force update select color based on current selected option
