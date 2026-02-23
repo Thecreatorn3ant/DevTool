@@ -138,9 +138,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     webviewView.webview.postMessage({ type: 'startResponse' });
 
                     const workspaceFiles = await this._getWorkspaceFiles();
-                    const editor = vscode.window.activeTextEditor;
+
+                    let editor = vscode.window.activeTextEditor;
+                    if (!editor && vscode.window.visibleTextEditors.length > 0) {
+                        editor = vscode.window.visibleTextEditors[0];
+                        const validEditors = vscode.window.visibleTextEditors.filter(e => e.document.uri.scheme === 'file');
+                        if (validEditors.length > 0) {
+                            editor = validEditors[0];
+                        }
+                    }
+
                     let activeContext = '';
-                    if (editor) {
+                    if (editor && editor.document.uri.scheme === 'file') {
                         const doc = editor.document;
                         const relativeName = vscode.workspace.asRelativePath(doc.fileName);
                         const fullText = doc.getText();
@@ -154,14 +163,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
                     let fullContext = '';
                     if (workspaceFiles.length > 0) {
-                        fullContext += `Structure du projet:\n${workspaceFiles.join('\n')}\n\n`;
-                    }
-                    if (activeContext) {
-                        fullContext += activeContext + '\n\n';
+                        fullContext += `[STRUCTURE DU PROJET]\n${workspaceFiles.join('\n')}\n\n`;
                     }
                     const historyContext = this._getFormattedHistory();
                     if (historyContext) {
-                        fullContext += `Historique de conversation:\n${historyContext}`;
+                        fullContext += `[HISTORIQUE DE CONVERSATION]\n${historyContext}\n\n`;
+                    }
+                    if (activeContext) {
+                        fullContext += `[FICHIER ACTIF (À MODIFIER SI DEMANDÉ)]\n${activeContext}\n\n`;
                     }
 
                     let fullResponse = '';
@@ -322,11 +331,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             if (files.length > 0) { targetUri = files[0]; }
         }
         if (!targetUri) {
-            const editor = vscode.window.activeTextEditor;
+            let editor = vscode.window.activeTextEditor;
+            if (!editor && vscode.window.visibleTextEditors.length > 0) {
+                editor = vscode.window.visibleTextEditors[0];
+                const validEditors = vscode.window.visibleTextEditors.filter(e => e.document.uri.scheme === 'file');
+                if (validEditors.length > 0) { editor = validEditors[0]; }
+            }
             if (editor) { targetUri = editor.document.uri; }
         }
         if (!targetUri) {
-            vscode.window.showErrorMessage("Aucun fichier cible trouvé. Ouvrez le fichier à modifier en éditeur actif.");
+            vscode.window.showErrorMessage("Aucun fichier cible trouvé. Ouvrez le fichier à modifier en éditeur principal.");
             return;
         }
 
@@ -388,12 +402,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         try {
             if (!result || result.includes("Rejeter") || result.includes("Annuler")) {
-                // rien
             } else if (result.includes("Insérer au curseur")) {
-                const editor = await vscode.window.showTextDocument(document);
+                let editor = vscode.window.activeTextEditor;
+                if (!editor || editor.document.uri.toString() !== document.uri.toString()) {
+                    editor = await vscode.window.showTextDocument(document);
+                }
                 const insertPos = editor.selection.active;
 
-                // Si c'est un patch échoué, on extrait juste le REPLACE pour ne pas insérer les balises SEARCH
                 let codeToInsert = codeContent;
                 if (hasMarkers && patchCount === 0) {
                     const match = codeContent.match(/====\s*([\s\S]*?)\s*>>>>/);
