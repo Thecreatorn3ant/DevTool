@@ -349,29 +349,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 vscode.window.showWarningMessage(err);
             }
         }
-        const ext = path.extname(document.fileName) || '.txt';
-        const tempUri = vscode.Uri.file(
-            path.join(os.tmpdir(), `ai_patch_${Date.now()}${ext}`)
-        );
-        await vscode.workspace.fs.writeFile(tempUri, Buffer.from(previewText, 'utf8'));
-
-        const diffTitle = `Review: ${path.basename(document.fileName)} (${patchCount > 0 ? `${patchCount} patch(s)` : 'Proposition'
-            })`;
-        await vscode.commands.executeCommand('vscode.diff', document.uri, tempUri, diffTitle);
 
         let result: string | undefined;
 
-        if (patchCount > 0) {
+        if (hasMarkers && patchCount === 0) {
+            result = await vscode.window.showWarningMessage(
+                `❌ Impossible d'appliquer le patch. Le code fourni par l'IA ne correspond pas EXACTEMENT au code du fichier (espaces, retours à la ligne, ou code fictif).\n\nVous pouvez l'insérer manuellement.`,
+                "📋 Insérer au curseur", "❌ Annuler"
+            );
+        } else if (patchCount > 0) {
+            const ext = path.extname(document.fileName) || '.txt';
+            const tempUri = vscode.Uri.file(
+                path.join(os.tmpdir(), `ai_patch_${Date.now()}${ext}`)
+            );
+            await vscode.workspace.fs.writeFile(tempUri, Buffer.from(previewText, 'utf8'));
+
+            const diffTitle = `Review: ${path.basename(document.fileName)} (${patchCount} patch(s))`;
+            await vscode.commands.executeCommand('vscode.diff', document.uri, tempUri, diffTitle);
+
             result = await vscode.window.showInformationMessage(
                 `Appliquer ${patchCount} modification(s) SEARCH/REPLACE à "${path.basename(targetUri.fsPath)}" ?`,
                 "✅ Accepter", "❌ Rejeter"
             );
-        } else if (hasMarkers && patchCount === 0) {
-            result = await vscode.window.showWarningMessage(
-                `⚠️ Aucune modification trouvée dans le fichier (le texte SEARCH ne correspond pas exactement).\n` +
-                `Vérifiez l'indentation. Vous pouvez quand même remplacer tout le fichier si vous voulez.`,
-                "🔄 Remplacer tout le fichier", "❌ Annuler"
-            );
+
+            try { await vscode.workspace.fs.delete(tempUri); } catch { /* ignore */ }
         } else {
             const contentLines = codeContent.split('\n').length;
             const isSnippet = contentLines < document.lineCount / 2;
@@ -387,11 +388,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         try {
             if (!result || result.includes("Rejeter") || result.includes("Annuler")) {
+                // rien
             } else if (result.includes("Insérer au curseur")) {
                 const editor = await vscode.window.showTextDocument(document);
                 const insertPos = editor.selection.active;
-                await editor.edit(eb => eb.insert(insertPos, codeContent));
-                this._highlightLines(editor, insertPos.line, insertPos.line + codeContent.split('\n').length - 1);
+
+                // Si c'est un patch échoué, on extrait juste le REPLACE pour ne pas insérer les balises SEARCH
+                let codeToInsert = codeContent;
+                if (hasMarkers && patchCount === 0) {
+                    const match = codeContent.match(/====\s*([\s\S]*?)\s*>>>>/);
+                    if (match && match[1]) { codeToInsert = match[1]; }
+                }
+
+                await editor.edit(eb => eb.insert(insertPos, codeToInsert));
+                this._highlightLines(editor, insertPos.line, insertPos.line + codeToInsert.split('\n').length - 1);
                 vscode.window.showInformationMessage("Snippet inséré !");
             } else if (result.includes("Accepter")) {
                 const oldText = document.getText();
@@ -420,8 +430,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 if (editor) { this._highlightChangedLines(editor, oldText, codeContent); }
                 vscode.window.showInformationMessage("🔄 Fichier remplacé et sauvegardé !");
             }
-        } finally {
-            try { await vscode.workspace.fs.delete(tempUri); } catch { /* ignore */ }
+        } catch (e: any) {
+            vscode.window.showErrorMessage(`Erreur lors de l'application: ${e.message}`);
         }
     }
 
