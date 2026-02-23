@@ -100,16 +100,32 @@ code
             if (apiKey) {
                 headers['Authorization'] = `Bearer ${apiKey}`;
             }
+            if (url.includes('openrouter')) {
+                headers['HTTP-Referer'] = 'https://github.com/microsoft/vscode';
+                headers['X-Title'] = 'VSCode Antigravity';
+            }
 
-            const response = await fetch(`${url}/api/generate`, {
+            const isOpenAI = this._isOpenAI(url);
+            const endpoint = isOpenAI ? `${url}/chat/completions` : `${url}/api/generate`;
+
+            const reqBody = isOpenAI ? {
+                model,
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: fullPrompt }
+                ],
+                stream: true
+            } : {
+                model,
+                prompt: fullPrompt,
+                system: systemPrompt,
+                stream: true
+            };
+
+            const response = await fetch(endpoint, {
                 method: 'POST',
                 headers,
-                body: JSON.stringify({
-                    model,
-                    prompt: fullPrompt,
-                    system: systemPrompt,
-                    stream: true
-                }),
+                body: JSON.stringify(reqBody),
             });
 
             if (!response.ok) {
@@ -135,32 +151,62 @@ code
                 buffer = lines.pop() ?? '';
 
                 for (const line of lines) {
-                    if (!line.trim()) { continue; }
-                    try {
-                        const data = JSON.parse(line);
-                        if (data.response) {
-                            fullResponse += data.response;
-                            onUpdate(data.response);
+                    const cleanLine = line.trim();
+                    if (!cleanLine) continue;
+
+                    if (isOpenAI) {
+                        if (cleanLine === 'data: [DONE]') continue;
+                        if (cleanLine.startsWith('data: ')) {
+                            try {
+                                const data = JSON.parse(cleanLine.slice(6));
+                                const content = data.choices?.[0]?.delta?.content;
+                                if (content) {
+                                    fullResponse += content;
+                                    onUpdate(content);
+                                }
+                            } catch (e) { /* ignore parse error for incomplete chunks */ }
                         }
-                        if (data.error) {
-                            throw new Error(data.error);
-                        }
-                    } catch (e: any) {
-                        if (e.message && !e.message.includes('JSON')) {
-                            throw e;
+                    } else {
+                        try {
+                            const data = JSON.parse(cleanLine);
+                            if (data.response) {
+                                fullResponse += data.response;
+                                onUpdate(data.response);
+                            }
+                            if (data.error) {
+                                throw new Error(data.error);
+                            }
+                        } catch (e: any) {
+                            if (e.message && !e.message.includes('JSON')) {
+                                throw e;
+                            }
                         }
                     }
                 }
             }
 
             if (buffer.trim()) {
-                try {
-                    const data = JSON.parse(buffer);
-                    if (data.response) {
-                        fullResponse += data.response;
-                        onUpdate(data.response);
+                if (isOpenAI) {
+                    const cleanLine = buffer.trim();
+                    if (cleanLine.startsWith('data: ') && cleanLine !== 'data: [DONE]') {
+                        try {
+                            const data = JSON.parse(cleanLine.slice(6));
+                            const content = data.choices?.[0]?.delta?.content;
+                            if (content) {
+                                fullResponse += content;
+                                onUpdate(content);
+                            }
+                        } catch (e) { /* ignore */ }
                     }
-                } catch { /* ignore */ }
+                } else {
+                    try {
+                        const data = JSON.parse(buffer.trim());
+                        if (data.response) {
+                            fullResponse += data.response;
+                            onUpdate(data.response);
+                        }
+                    } catch { /* ignore */ }
+                }
             }
 
             return fullResponse;
@@ -181,16 +227,35 @@ code
         return await this.generateStreamingResponse(prompt, context, (c) => { full += c; }, modelOverride);
     }
 
+    private _isOpenAI(url: string): boolean {
+        return url.includes('together') || url.includes('openrouter') || url.endsWith('/v1');
+    }
+
     async listModels(): Promise<string[]> {
         try {
             const url = this._getBaseUrl();
-            const response = await fetch(`${url}/api/tags`, {
+            const config = this._getConfig();
+            const apiKey = config.get<string>('apiKey') || '';
+            const headers: Record<string, string> = {};
+            if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+            const isOpenAI = this._isOpenAI(url);
+            const endpoint = isOpenAI ? `${url}/models` : `${url}/api/tags`;
+
+            const response = await fetch(endpoint, {
+                headers,
                 signal: AbortSignal.timeout(5000)
             });
             if (!response.ok) { return []; }
             const data: any = await response.json();
-            if (!Array.isArray(data?.models)) { return []; }
-            return data.models.map((m: any) => m.name as string).filter(Boolean);
+
+            if (isOpenAI) {
+                if (!Array.isArray(data?.data)) { return []; }
+                return data.data.map((m: any) => m.id as string).filter(Boolean);
+            } else {
+                if (!Array.isArray(data?.models)) { return []; }
+                return data.models.map((m: any) => m.name as string).filter(Boolean);
+            }
         } catch (error) {
             console.error('Failed to list models:', error);
             return [];
@@ -200,7 +265,15 @@ code
     async checkConnection(): Promise<boolean> {
         try {
             const url = this._getBaseUrl();
-            const response = await fetch(`${url}/api/tags`, {
+            const isOpenAI = this._isOpenAI(url);
+            const endpoint = isOpenAI ? `${url}/models` : `${url}/api/tags`;
+            const config = this._getConfig();
+            const apiKey = config.get<string>('apiKey') || '';
+            const headers: Record<string, string> = {};
+            if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+            const response = await fetch(endpoint, {
+                headers,
                 signal: AbortSignal.timeout(3000)
             });
             return response.ok;
