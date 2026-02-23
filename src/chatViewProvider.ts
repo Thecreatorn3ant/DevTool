@@ -198,7 +198,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
             let formattedModels = models.map(m => {
                 if (m.isLocal) {
-                    return { value: m.name, url: m.url, label: `💻 ${m.name} (⚠️ Déconseillé gros fichiers)`, isLocal: true };
+                    return { value: m.name, url: m.url, label: `💻 ${m.name}`, isLocal: true };
                 } else {
                     return { value: m.name, url: m.url, label: `☁️ ${m.name}`, isLocal: false };
                 }
@@ -315,7 +315,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <body><div class="space-bg"></div>
             <div class="header">
                 <span style="font-weight:900; letter-spacing:1px;">ANTIGRAVITY</span>
-                <div><button id="btnCloud" style="background:none; border:1px solid #00d2ff; color:#00d2ff; padding:3px 8px; font-size:11px;">☁️ Cloud</button> <select id="modelSelect"></select></div>
+                <div style="display:flex; gap:6px; align-items:center;">
+                    <button id="btnCloud" style="background:none; border:1px solid #00d2ff; color:#00d2ff; padding:4px 8px; font-size:11px; border-radius:4px; cursor:pointer;">☁️ Cloud</button> 
+                    <select id="modelSelect" style="max-width:140px; padding:3px; border-radius:4px; background:#111; border:1px solid #333; outline:none; text-overflow:ellipsis; white-space:nowrap; overflow:hidden;"></select>
+                </div>
+            </div>
+            <div id="localWarn" style="display:none; background:rgba(177,156,217,0.15); color:#b19cd9; padding:6px; font-size:11px; text-align:center; border-bottom:1px solid rgba(177,156,217,0.3);">
+                ⚠️ <b>Mode Local</b> : Déconseillé pour les gros fichiers (risques d'erreurs).
             </div>
             <div id="chat"></div>
             <div class="input-area">
@@ -360,6 +366,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             if (selectedOption) {
                                 modelSelect.style.color = selectedOption.style.color;
                                 modelSelect.style.borderColor = selectedOption.style.color;
+                                const url = selectedOption.getAttribute('data-url');
+                                const isLocal = url && (url.includes('localhost') || url.includes('127.0.0.1'));
+                                document.getElementById('localWarn').style.display = isLocal ? 'block' : 'none';
                             }
                         };
                         modelSelect.onchange = () => {
