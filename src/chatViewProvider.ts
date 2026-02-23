@@ -44,7 +44,6 @@ function applySearchReplace(
                 searchLines.push(line);
             }
         } else if (state === 'replace') {
-            // Accept >>> OR a second ==== (when AI forgets the closing marker)
             if (isCloseMarker(line) || (isSeparator(line) && replaceLines.length > 0)) {
                 patches.push({
                     search: searchLines.join('\n'),
@@ -57,7 +56,6 @@ function applySearchReplace(
         }
     }
 
-    // EOF while still in 'replace' state — close the final block gracefully
     if (state === 'replace' && searchLines.length > 0) {
         patches.push({
             search: searchLines.join('\n'),
@@ -139,7 +137,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
                     webviewView.webview.postMessage({ type: 'startResponse' });
 
-                    // Build context
                     const workspaceFiles = await this._getWorkspaceFiles();
                     const editor = vscode.window.activeTextEditor;
                     let activeContext = '';
@@ -248,9 +245,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    /**
-     * Called from extension commands to pre-send a message into the chat.
-     */
     public sendMessageFromEditor(message: string) {
         if (this._view) {
             this._view.webview.postMessage({ type: 'injectMessage', value: message });
@@ -262,7 +256,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private _getFormattedHistory(): string {
-        // Last 8 exchanges (16 messages)
         return this._history
             .slice(-16)
             .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.value.substring(0, 500)}`)
@@ -316,7 +309,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async _handleApplyEdit(codeContent: string, targetFile?: string) {
-        // Resolve target document
         let targetUri: vscode.Uri | undefined;
         if (targetFile) {
             const cleanTarget = targetFile.replace(/\[FILE:\s*|\]/g, '').trim();
@@ -335,7 +327,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const document = await vscode.workspace.openTextDocument(targetUri);
         const documentText = document.getText();
 
-        // Detect if the content has SEARCH/REPLACE markers
         const hasMarkers = /^<{2,}\s*SEARCH\s*$/m.test(codeContent.replace(/\r\n/g, '\n'));
 
         let previewText = codeContent;
@@ -348,13 +339,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             patchCount = patchResult.patchCount;
             patchErrors = patchResult.errors;
 
-            // Show errors as warnings
             for (const err of patchErrors) {
                 vscode.window.showWarningMessage(err);
             }
         }
-
-        // Create a temp file for diff preview
         const ext = path.extname(document.fileName) || '.txt';
         const tempUri = vscode.Uri.file(
             path.join(os.tmpdir(), `ai_patch_${Date.now()}${ext}`)
@@ -365,7 +353,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             })`;
         await vscode.commands.executeCommand('vscode.diff', document.uri, tempUri, diffTitle);
 
-        // Ask user to confirm
         let result: string | undefined;
 
         if (patchCount > 0) {
@@ -374,14 +361,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 "✅ Accepter", "❌ Rejeter"
             );
         } else if (hasMarkers && patchCount === 0) {
-            // Patch parsing failed – still show a dialog so the user has control
             result = await vscode.window.showWarningMessage(
                 `⚠️ Aucune modification trouvée dans le fichier (le texte SEARCH ne correspond pas exactement).\n` +
                 `Vérifiez l'indentation. Vous pouvez quand même remplacer tout le fichier si vous voulez.`,
                 "🔄 Remplacer tout le fichier", "❌ Annuler"
             );
         } else {
-            // No markers - determine if snippet or full file
             const contentLines = codeContent.split('\n').length;
             const isSnippet = contentLines < document.lineCount / 2;
             const options: string[] = isSnippet
@@ -396,13 +381,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         try {
             if (!result || result.includes("Rejeter")) {
-                // Nothing to do
             } else if (result.includes("Insérer au curseur")) {
                 const editor = await vscode.window.showTextDocument(document);
                 await editor.edit(eb => eb.insert(editor.selection.active, codeContent));
                 vscode.window.showInformationMessage("Snippet inséré !");
             } else if (result.includes("Accepter")) {
-                // Apply patch
                 const edit = new vscode.WorkspaceEdit();
                 const fullRange = new vscode.Range(
                     document.lineAt(0).range.start,
@@ -413,7 +396,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 await document.save();
                 vscode.window.showInformationMessage(`✅ Patch appliqué (${patchCount} bloc(s)) et sauvegardé !`);
             } else {
-                // Full replacement
                 const edit = new vscode.WorkspaceEdit();
                 const fullRange = new vscode.Range(
                     document.lineAt(0).range.start,
@@ -430,7 +412,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async _handleOpenFile(filePath: string) {
-        // Try relative to workspace first
         const files = await vscode.workspace.findFiles(`**/${filePath}`, '**/node_modules/**', 1);
         if (files.length > 0) {
             const document = await vscode.workspace.openTextDocument(files[0]);
@@ -472,8 +453,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         );
         const cspSource = webview.cspSource;
 
-        // ── JS extracted into a plain string to avoid backtick conflicts ──────
-        // Inside a regular string, backticks are safe and do NOT need escaping.
         const webviewScript: string = [
             "(function() {",
             "    const vscode = acquireVsCodeApi();",
@@ -670,7 +649,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "})();"
         ].join("\n");
 
-        // ── HTML template — no JS backticks here, only ${} interpolations ────
         return `<!DOCTYPE html>
 <html lang="fr">
 <head>

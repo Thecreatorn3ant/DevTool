@@ -89,7 +89,7 @@ Sois bref, technique et scrupuleux sur l'indentation.`;
 
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split('\n');
-                buffer = lines.pop() ?? ''; // keep incomplete last line
+                buffer = lines.pop() ?? '';
 
                 for (const line of lines) {
                     if (!line.trim()) { continue; }
@@ -110,7 +110,6 @@ Sois bref, technique et scrupuleux sur l'indentation.`;
                 }
             }
 
-            // Process any remaining buffer
             if (buffer.trim()) {
                 try {
                     const data = JSON.parse(buffer);
