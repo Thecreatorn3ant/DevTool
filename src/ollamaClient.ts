@@ -1,5 +1,12 @@
 import * as vscode from 'vscode';
 
+export interface ApiKeyEntry {
+    key: string;
+    label: string;
+    platform?: string;
+    rateLimitedUntil?: number;
+}
+
 export class OllamaClient {
 
     private _getConfig() {
@@ -10,90 +17,63 @@ export class OllamaClient {
         return this._getConfig().get<string>('ollamaUrl') || 'http://localhost:11434';
     }
 
+    private _getApiKeys(): ApiKeyEntry[] {
+        return this._getConfig().get<ApiKeyEntry[]>('apiKeys') || [];
+    }
+
+    private async _saveApiKeys(keys: ApiKeyEntry[]) {
+        await this._getConfig().update('apiKeys', keys, true);
+    }
+
+    private _getAvailableKey(platform: string): string {
+        const config = this._getConfig();
+        const mainKey = config.get<string>('apiKey') || '';
+        const allKeys = this._getApiKeys();
+        const now = Date.now();
+
+        const best = allKeys.find(k => k.key && (!k.platform || platform.includes(k.platform)) && (!k.rateLimitedUntil || k.rateLimitedUntil < now));
+        if (best) return best.key;
+
+        return mainKey;
+    }
+
+    private async _markKeyAsRateLimited(key: string) {
+        const allKeys = this._getApiKeys();
+        const now = Date.now();
+        let changed = false;
+        const updated = allKeys.map(k => {
+            if (k.key === key) {
+                changed = true;
+                return { ...k, rateLimitedUntil: now + 60000 };
+            }
+            return k;
+        });
+        if (changed) {
+            await this._saveApiKeys(updated);
+        }
+    }
+
     async generateStreamingResponse(
         prompt: string,
         context: string,
         onUpdate: (chunk: string) => void,
         modelOverride?: string
     ): Promise<string> {
-        const config = this._getConfig();
         const url = this._getBaseUrl();
+        const config = this._getConfig();
         const model = modelOverride || config.get<string>('defaultModel') || 'llama3';
-
-        const systemPrompt = `Tu es une IA d'édition de code intégrée dans VS Code. Ton seul but est d'éditer le code de l'utilisateur.
-
-━━━ COMPORTEMENT STRICT ABSOLU (SINON ÉCHEC) ━━━
-- RÉPONDRE EXCLUSIVEMENT EN FRANÇAIS. Ne parle jamais une autre langue.
-- NE DONNE JAMAIS D'EXEMPLES GÉNÉRIQUES OU DE TUTORIELS.
-- Modifie UNIQUEMENT le vrai code fourni dans le contexte (la section [FICHIER ACTIF]). N'invente pas un faux code d'exemple (ex: "hello world").
-- Style robotique : PAS de salutations, PAS d'explications ("voici comment faire", "tu devrais..."), PAS de conclusion.
-- Fournis directement le correctif.
-
-━━━ FORMAT OBLIGATOIRE POUR MODIFIER UN FICHIER ━━━
-Toujours utiliser les blocs SEARCH/REPLACE. Le bloc SEARCH DOIT être un copié-collé exact (indentation stricte) du code actuel en contexte.
-
-\`\`\`typescript
-<<<< SEARCH
-code_exact_existant_à_remplacer
-====
-nouveau_code
->>>>
-\`\`\`
-
-Règles absolues de parsage :
-1. Le bloc SEARCH DOIT OBLIGATOIREMENT inclure au moins 2 lignes non-modifiées AVANT le changement et 2 lignes non-modifiées APRÈS.
-2. Si tu ne mets pas ce contexte exact, notre système plantera.
-3. Le bloc SEARCH doit être un copié-collé STRICT du code actuel. Ne résume jamais avec des "...".
-4. Ne réécris pas tout le fichier, limite-toi au fragment exact.
-
-━━━ EXEMPLE DE BONNE RÉPONSE (À IMITER ABSOLUMENT) ━━━
-Utilisateur: ajoute un log d'erreur dans le catch
-
-Réponse attendue (sans aucun autre texte) :
-\`\`\`typescript
-<<<< SEARCH
-        try {
-            await this.db.connect();
-            this.isConnected = true;
-        } catch (e) {
-            this.isConnected = false;
-        }
-====
-        try {
-            await this.db.connect();
-            this.isConnected = true;
-        } catch (e) {
-            console.error("Erreur :", e);
-            this.isConnected = false;
-        }
->>>>
-\`\`\`
-
-━━━ NOUVEAU FICHIER ━━━
-[FILE: chemin/fichier.ext]
-\`\`\`
-code
-\`\`\`
-
-━━━ COMMANDES TERMINAL ━━━
-[RUN: commande]`;
 
         const fullPrompt = context
             ? `Contexte du projet:\n${context}\n\n---\nQuestion: ${prompt}`
             : prompt;
 
-        let apiKey = config.get<string>('apiKey') || '';
+        return await this._doRequestWithRetry(url, model, fullPrompt, onUpdate);
+    }
 
-        if (apiKey.startsWith('http') && apiKey.includes('key=')) {
-            try {
-                const urlObj = new URL(apiKey);
-                const extractedKey = urlObj.searchParams.get('key');
-                if (extractedKey) {
-                    apiKey = extractedKey;
-                }
-            } catch (e) {
-            }
-        }
+    private async _doRequestWithRetry(url: string, model: string, fullPrompt: string, onUpdate: (chunk: string) => void, attempt: number = 0): Promise<string> {
+        const apiKey = this._getAvailableKey(url);
+        const isOpenAI = this._isOpenAI(url);
+        const systemPrompt = this._getSystemPrompt();
 
         try {
             const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -105,7 +85,6 @@ code
                 headers['X-Title'] = 'VSCode Antigravity';
             }
 
-            const isOpenAI = this._isOpenAI(url);
             const endpoint = isOpenAI ? `${url}/chat/completions` : `${url}/api/generate`;
 
             const reqBody = isOpenAI ? {
@@ -128,15 +107,21 @@ code
                 body: JSON.stringify(reqBody),
             });
 
+            if (response.status === 429 && attempt < 3) {
+                if (apiKey) {
+                    await this._markKeyAsRateLimited(apiKey);
+                    vscode.window.showWarningMessage("⏳ Rate Limit atteint sur ce compte. Basculement sur un autre disponible...");
+                    return this._doRequestWithRetry(url, model, fullPrompt, onUpdate, attempt + 1);
+                }
+            }
+
             if (!response.ok) {
                 const errorText = await response.text();
                 throw new Error(`HTTP ${response.status}: ${errorText || response.statusText}`);
             }
 
             const reader = response.body?.getReader();
-            if (!reader) {
-                throw new Error("Impossible de lire le flux de réponse.");
-            }
+            if (!reader) throw new Error("Impossible de lire le flux de réponse.");
 
             const decoder = new TextDecoder();
             let fullResponse = '';
@@ -164,7 +149,7 @@ code
                                     fullResponse += content;
                                     onUpdate(content);
                                 }
-                            } catch (e) { /* ignore parse error for incomplete chunks */ }
+                            } catch (e) { /* ignore parse error */ }
                         }
                     } else {
                         try {
@@ -173,13 +158,9 @@ code
                                 fullResponse += data.response;
                                 onUpdate(data.response);
                             }
-                            if (data.error) {
-                                throw new Error(data.error);
-                            }
+                            if (data.error) throw new Error(data.error);
                         } catch (e: any) {
-                            if (e.message && !e.message.includes('JSON')) {
-                                throw e;
-                            }
+                            if (e.message && !e.message.includes('JSON')) throw e;
                         }
                     }
                 }
@@ -187,25 +168,18 @@ code
 
             if (buffer.trim()) {
                 if (isOpenAI) {
-                    const cleanLine = buffer.trim();
-                    if (cleanLine.startsWith('data: ') && cleanLine !== 'data: [DONE]') {
+                    if (buffer.startsWith('data: ') && buffer !== 'data: [DONE]') {
                         try {
-                            const data = JSON.parse(cleanLine.slice(6));
+                            const data = JSON.parse(buffer.slice(6));
                             const content = data.choices?.[0]?.delta?.content;
-                            if (content) {
-                                fullResponse += content;
-                                onUpdate(content);
-                            }
-                        } catch (e) { /* ignore */ }
+                            if (content) { fullResponse += content; onUpdate(content); }
+                        } catch { }
                     }
                 } else {
                     try {
-                        const data = JSON.parse(buffer.trim());
-                        if (data.response) {
-                            fullResponse += data.response;
-                            onUpdate(data.response);
-                        }
-                    } catch { /* ignore */ }
+                        const data = JSON.parse(buffer);
+                        if (data.response) { fullResponse += data.response; onUpdate(data.response); }
+                    } catch { }
                 }
             }
 
@@ -214,12 +188,36 @@ code
         } catch (error: any) {
             const msg = error.message || String(error);
             if (msg.includes('fetch') || msg.includes('ECONNREFUSED') || msg.includes('NetworkError')) {
-                vscode.window.showErrorMessage(`Ollama inaccessible. Vérifiez qu'Ollama est bien lancé sur ${url}`);
+                vscode.window.showErrorMessage(`Serveur inaccessible sur ${url}`);
             } else {
-                vscode.window.showErrorMessage(`Erreur Ollama: ${msg}`);
+                vscode.window.showErrorMessage(`Erreur IA: ${msg}`);
             }
             return '';
         }
+    }
+
+    private _getSystemPrompt(): string {
+        return `Tu es une IA d'édition de code intégrée dans VS Code. Ton seul but est d'éditer le code de l'utilisateur.
+
+━━━ COMPORTEMENT STRICT ABSOLU (SINON ÉCHEC) ━━━
+- RÉPONDRE EXCLUSIVEMENT EN FRANÇAIS.
+- Modifie UNIQUEMENT le vrai code fourni dans le contexte (la section [FICHIER ACTIF]).
+- Style robotique : PAS de salutations, PAS d'explications. Fournis directement le correctif.
+
+━━━ FORMAT OBLIGATOIRE POUR MODIFIER UN FICHIER ━━━
+Toujours utiliser les blocs SEARCH/REPLACE. 
+
+\`\`\`typescript
+<<<< SEARCH
+code_exact_existant
+====
+nouveau_code
+>>>>
+\`\`\`
+
+Règles :
+1. SEARCH doit être un copié-collé STRICT.
+2. Inclure 2 lignes de contexte avant et après.`;
     }
 
     async generateResponse(prompt: string, context: string = '', modelOverride?: string): Promise<string> {
@@ -232,53 +230,35 @@ code
     }
 
     async listModels(): Promise<string[]> {
-        try {
-            const url = this._getBaseUrl();
-            const config = this._getConfig();
-            const apiKey = config.get<string>('apiKey') || '';
-            const headers: Record<string, string> = {};
-            if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+        const url = this._getBaseUrl();
+        const apiKey = this._getAvailableKey(url);
+        const headers: Record<string, string> = {};
+        if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
 
+        try {
             const isOpenAI = this._isOpenAI(url);
             const endpoint = isOpenAI ? `${url}/models` : `${url}/api/tags`;
-
-            const response = await fetch(endpoint, {
-                headers,
-                signal: AbortSignal.timeout(5000)
-            });
-            if (!response.ok) { return []; }
+            const response = await fetch(endpoint, { headers, signal: AbortSignal.timeout(5000) });
+            if (!response.ok) return [];
             const data: any = await response.json();
-
             if (isOpenAI) {
-                if (!Array.isArray(data?.data)) { return []; }
-                return data.data.map((m: any) => m.id as string).filter(Boolean);
+                return (data?.data || []).map((m: any) => m.id).filter(Boolean);
             } else {
-                if (!Array.isArray(data?.models)) { return []; }
-                return data.models.map((m: any) => m.name as string).filter(Boolean);
+                return (data?.models || []).map((m: any) => m.name).filter(Boolean);
             }
-        } catch (error) {
-            console.error('Failed to list models:', error);
-            return [];
-        }
+        } catch { return []; }
     }
 
     async checkConnection(): Promise<boolean> {
+        const url = this._getBaseUrl();
+        const apiKey = this._getAvailableKey(url);
+        const headers: Record<string, string> = {};
+        if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
         try {
-            const url = this._getBaseUrl();
             const isOpenAI = this._isOpenAI(url);
             const endpoint = isOpenAI ? `${url}/models` : `${url}/api/tags`;
-            const config = this._getConfig();
-            const apiKey = config.get<string>('apiKey') || '';
-            const headers: Record<string, string> = {};
-            if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-
-            const response = await fetch(endpoint, {
-                headers,
-                signal: AbortSignal.timeout(3000)
-            });
+            const response = await fetch(endpoint, { headers, signal: AbortSignal.timeout(3000) });
             return response.ok;
-        } catch {
-            return false;
-        }
+        } catch { return false; }
     }
 }
