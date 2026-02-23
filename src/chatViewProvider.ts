@@ -219,21 +219,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     }
 
                     let fullResponse = '';
-                    const response = await this._ollamaClient.generateStreamingResponse(
-                        userMsg,
-                        fullContext.trim(),
-                        (chunk) => {
-                            fullResponse += chunk;
-                            webviewView.webview.postMessage({ type: 'partialResponse', value: chunk });
-                        },
-                        data.model
-                    );
+                    webviewView.webview.postMessage({ type: 'startResponse' });
 
-                    if (response) {
+                    try {
+                        const response = await this._ollamaClient.generateStreamingResponse(
+                            userMsg,
+                            fullContext,
+                            (chunk) => {
+                                fullResponse += chunk;
+                                webviewView.webview.postMessage({ type: 'partialResponse', value: chunk });
+                            },
+                            data.model
+                        );
                         this._history.push({ role: 'ai', value: response });
                         this._updateHistory();
+                        webviewView.webview.postMessage({ type: 'endResponse', value: response });
+                    } catch (err: any) {
+                        vscode.window.showErrorMessage("Erreur IA: " + err.message);
+                        webviewView.webview.postMessage({ type: 'endResponse', value: "\n**Erreur**: " + err.message });
                     }
-                    webviewView.webview.postMessage({ type: 'endResponse', value: response || fullResponse });
+                    break;
+                }
+
+                case 'openCloudConnect': {
+                    await this._handleCloudConnection();
                     break;
                 }
 
@@ -311,10 +320,56 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    private async _handleCloudConnection() {
+        // Demande de l'URL
+        let url = await vscode.window.showInputBox({
+            prompt: "URL du Fournisseur Cloud (ex: https://api.together.xyz/v1 ou URL par défaut d'Ollama)",
+            placeHolder: "http://localhost:11434",
+            value: "http://localhost:11434"
+        });
+
+        if (url === undefined) return;
+
+        const apiKey = await vscode.window.showInputBox({
+            prompt: "Clé API (Bearer) ou Lien Ollama Connect entier (Laissez vide si c'est votre Ollama local)",
+            placeHolder: "sk-..., ssh-ed25519..., ou https://ollama.com/connect?...",
+            password: true
+        });
+
+        if (apiKey === undefined) return;
+
+        const config = vscode.workspace.getConfiguration('local-ai');
+        await config.update('ollamaUrl', url, true);
+        await config.update('apiKey', apiKey, true);
+
+        vscode.window.showInformationMessage("✅ Configuration Cloud enregistrée ! Les modèles distants vont être récupérés.");
+
+        this._updateModelsList();
+    }
+
     private _updateHistory() {
         this._context.workspaceState.update('chatHistory', this._history);
     }
 
+    private async _updateModelsList() {
+        if (this._view) {
+            try {
+                const models = await this._ollamaClient.listModels();
+                let selected = '';
+                if (models.length > 0) {
+                    const priority = ['codellama', 'deepseek-coder', 'gemma', 'llama', 'mistral', 'qwen'];
+                    for (const p of priority) {
+                        const found = models.find(m => m.toLowerCase().includes(p));
+                        if (found) { selected = found; break; }
+                    }
+                    if (!selected) { selected = models[0]; }
+                }
+                this._view.webview.postMessage({ type: 'setModels', models, selected });
+            } catch {
+                this._view.webview.postMessage({ type: 'setModels', models: [], selected: '' });
+            }
+        }
+    }
     private _getFormattedHistory(): string {
         return this._history
             .slice(-16)
@@ -714,7 +769,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "        vscode.postMessage({ type: 'clearHistory' });",
             "    };",
             "",
-            "    window.addEventListener('message', function(event) {",
+            "    const btnCloud = document.getElementById('btnCloud');",
+            "    btnCloud.onclick = function () {",
+            "        vscode.postMessage({ type: 'openCloudConnect' });",
+            "    };",
+            "",
+            "    window.addEventListener('message', function (event) {",
             "        var m = event.data;",
             "        switch (m.type) {",
             "            case 'startResponse':",
@@ -798,6 +858,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .header-title { font-weight: 800; font-size: 14px; letter-spacing: 1px; color: #fff; }
         .header-controls { display: flex; gap: 6px; align-items: center; }
         #modelSelect { background: #111; color: #00d2ff; border: 1px solid rgba(0,210,255,0.25); border-radius: 6px; font-size: 10px; padding: 4px 8px; cursor: pointer; outline: none; max-width: 130px; }
+        #btnCloud { background: rgba(0,150,255,0.15); border: 1px solid rgba(0,150,255,0.3); color: #00d2ff; cursor: pointer; font-size: 10px; padding: 4px 8px; border-radius: 6px; font-weight: 600; transition: 0.2s; white-space: nowrap; }
+        #btnCloud:hover { background: rgba(0,150,255,0.3); box-shadow: 0 0 8px rgba(0,150,255,0.4); }
         #clearChat { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #aaa; cursor: pointer; font-size: 10px; padding: 4px 10px; border-radius: 6px; transition: 0.2s; }
         #clearChat:hover { background: rgba(255,80,80,0.15); color: #ff6b6b; border-color: rgba(255,80,80,0.3); }
         #connectionStatus { font-size: 9px; padding: 2px 6px; border-radius: 10px; font-weight: 600; }
@@ -845,6 +907,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             </div>
             <div class="header-controls">
                 <span id="connectionStatus">&#9679;</span>
+                <button id="btnCloud">&#9729; Cloud</button>
                 <select id="modelSelect"><option>Chargement...</option></select>
                 <button id="clearChat">Effacer</button>
             </div>
