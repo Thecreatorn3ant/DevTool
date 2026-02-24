@@ -62,4 +62,14 @@ Ce projet est Open Source. Si vous souhaitez modifier le code ou ajouter des fon
 4. Appuyez sur `F5` pour tester vos modifications dans une nouvelle fenêtre.
 
 ---
+
+## 🛠️ Workflow de développement
+
+Pour garder le projet stable, nous utilisons deux branches principales :
+- `main` : Contient les versions stables et les releases VSIX.
+- `dev` : Branche de travail. Toutes les Pull Requests doivent cibler cette branche.
+
+**Note aux contributeurs :** Merci de ne pas pousser directement sur `dev` ou `main`. Créez une branche par fonctionnalité (ex: `feature/ma-super-option`).
+
+---
 *Développé avec passion pour rendre l'IA locale accessible à tous les développeurs.*
