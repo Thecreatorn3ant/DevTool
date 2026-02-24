@@ -549,7 +549,9 @@ Règles :
                             : (data?.models || []).map((m: any) => (m.name ?? m.id) as string).filter(Boolean);
                     }
                 }
-                for (const m of list) {
+                const isOpenRouter = provider === 'openrouter';
+                const filteredList = isOpenRouter ? list.filter((m: string) => m.endsWith(':free')) : list;
+                for (const m of filteredList) {
                     const k = `${baseUrl}||${m}`;
                     const isLocal = !entry.key && (baseUrl === LOCAL_URL || baseUrl === 'http://127.0.0.1:11434');
                     if (!seen.has(k)) { seen.add(k); result.push({ name: m, isLocal, url: baseUrl, provider: isLocal ? 'local' : provider }); }

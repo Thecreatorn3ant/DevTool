@@ -94,22 +94,41 @@ export class FileContextManager {
         return null;
     }
 
-    async handleAiFileRequest(filePath: string): Promise<{ name: string; content: string } | null> {
+    isInWorkspace(filePath: string): boolean {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) return false;
+        if (!path.isAbsolute(filePath)) return true;
+        return workspaceFolders.some(folder => filePath.startsWith(folder.uri.fsPath));
+    }
+
+    async handleAiFileRequest(
+        filePath: string,
+        filePermission: 'ask-all' | 'ask-workspace' | 'allow-all' = 'ask-workspace'
+    ): Promise<{ name: string; content: string } | null> {
+        const inWorkspace = this.isInWorkspace(filePath);
         const isSensitive = filePath.includes('.env') || filePath.includes('secret') ||
             filePath.includes('password') || filePath.includes('credential');
 
-        const warningMsg = isSensitive
-            ? `⚠️ L'IA demande accès à un fichier sensible : "${filePath}". Autoriser ?`
-            : `L'IA demande accès à : "${filePath}". Autoriser ?`;
+        let needsConfirm = false;
+        if (isSensitive) {
+            needsConfirm = true;
+        } else if (filePermission === 'ask-all') {
+            needsConfirm = true;
+        } else if (filePermission === 'ask-workspace') {
+            needsConfirm = !inWorkspace;
+        } else if (filePermission === 'allow-all') {
+            needsConfirm = false;
+        }
 
-        const result = await vscode.window.showInformationMessage(
-            warningMsg,
-            { modal: true },
-            '✅ Autoriser',
-            '❌ Refuser'
-        );
-
-        if (result !== '✅ Autoriser') return null;
+        if (needsConfirm) {
+            const warningMsg = isSensitive
+                ? `⚠️ L'IA demande accès à un fichier sensible : "${filePath}". Autoriser ?`
+                : `L'IA demande accès à un fichier hors workspace : "${filePath}". Autoriser ?`;
+            const result = await vscode.window.showInformationMessage(
+                warningMsg, { modal: true }, '✅ Autoriser', '❌ Refuser'
+            );
+            if (result !== '✅ Autoriser') return null;
+        }
 
         const file = await this.readFile(filePath);
         if (!file) {
