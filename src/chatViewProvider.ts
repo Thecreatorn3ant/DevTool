@@ -183,6 +183,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private async _handleSendMessage(userMsg: string, model?: string, targetUrl?: string) {
         if (!userMsg || !this._view) { return; }
 
+        let resolvedModel = model || '';
+        let resolvedUrl = targetUrl || '';
+        if (resolvedModel.includes('||')) {
+            const parts = resolvedModel.split('||');
+            resolvedUrl = parts[0];
+            resolvedModel = parts[1];
+        }
+
         this._history.push({ role: 'user', value: userMsg });
         this._updateHistory();
         this._view.webview.postMessage({ type: 'startResponse' });
@@ -224,8 +232,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     fullRes += chunk;
                     this._view?.webview.postMessage({ type: 'partialResponse', value: chunk });
                 },
-                model,
-                targetUrl
+                resolvedModel,
+                resolvedUrl
             );
             const finalResponse = response || fullRes;
             this._history.push({ role: 'ai', value: finalResponse });
@@ -292,7 +300,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         try {
             const allModels = await this._ollamaClient.listAllModels();
-
             const formattedModels: Array<{
                 label: string; value: string; name: string; url: string; isLocal: boolean;
             }> = allModels.map(m => ({
@@ -303,13 +310,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 isLocal: m.isLocal
             }));
 
-            if (cloudUrl && cloudKey) {
+            const config = vscode.workspace.getConfiguration('local-ai');
+            const savedKeys: Array<{ name: string; key: string; url: string }> =
+                config.get<any[]>('apiKeys') || [];
+
+            const providersToFetch = [...savedKeys];
+            if (cloudUrl && cloudKey && !providersToFetch.find(k => k.url === cloudUrl)) {
+                providersToFetch.push({ name: 'Cloud', url: cloudUrl, key: cloudKey });
+            }
+
+            for (const provider of providersToFetch) {
                 try {
-                    const isOpenAI = cloudUrl.includes('together') || cloudUrl.includes('openrouter') || cloudUrl.endsWith('/v1');
-                    const endpoint = isOpenAI ? `${cloudUrl}/models` : `${cloudUrl}/api/tags`;
+                    const isOpenAI = provider.url.includes('together') || provider.url.includes('openrouter') || provider.url.endsWith('/v1');
+                    const endpoint = isOpenAI ? `${provider.url}/models` : `${provider.url}/api/tags`;
                     const res = await fetch(endpoint, {
-                        headers: { 'Authorization': `Bearer ${cloudKey}` },
-                        signal: AbortSignal.timeout(5000)
+                        headers: { 'Authorization': `Bearer ${provider.key}` },
+                        signal: AbortSignal.timeout(4000)
                     });
                     if (res.ok) {
                         const data: any = await res.json();
@@ -317,18 +333,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             ? (data?.data || []).map((m: any) => m.id as string).filter(Boolean)
                             : (data?.models || []).map((m: any) => (m.name ?? m.id) as string).filter(Boolean);
                         cloudList.forEach(m => {
-                            if (!formattedModels.find(x => x.name === m && x.url === cloudUrl)) {
+                            const val = `${provider.url}||${m}`;
+                            if (!formattedModels.find(x => x.value === val)) {
                                 formattedModels.push({
                                     label: `☁️  ${m}`,
-                                    value: `${cloudUrl}||${m}`,
+                                    value: val,
                                     name: m,
-                                    url: cloudUrl,
+                                    url: provider.url,
                                     isLocal: false
                                 });
                             }
                         });
                     }
-                } catch { /* cloud fetch failed silently */ }
+                } catch { /* provider unreachable — skip silently */ }
             }
 
             const lastSelected = this._context.workspaceState.get<string>('lastSelectedModel');
@@ -557,6 +574,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "    return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');",
             "}",
             "",
+            "// Global code registry — avoids fragile inline onclick with special chars",
+            "window._codeRegistry = [];",
+            "function _registerCode(content) {",
+            "    window._codeRegistry.push(content);",
+            "    return window._codeRegistry.length - 1;",
+            "}",
+            "function _applyCode(idx) {",
+            "    var content = window._codeRegistry[idx];",
+            "    if (content !== undefined) { vscode.postMessage({ type: 'applyToActiveFile', value: content }); }",
+            "}",
+            "function _copyCode(btn, idx) {",
+            "    var content = window._codeRegistry[idx];",
+            "    if (content === undefined) { return; }",
+            "    navigator.clipboard.writeText(content).then(function() {",
+            "        btn.textContent = '\\u2713 Copi\\u00E9 !';",
+            "        setTimeout(function() { btn.textContent = 'Copier'; }, 2000);",
+            "    });",
+            "}",
+            "",
             "function renderMarkdown(text) {",
             "    var blocks = [];",
             "    var FENCE = String.fromCharCode(96,96,96);",
@@ -565,19 +601,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "        lang = (lang || '').trim();",
             "        var isPatch = inner.indexOf('<<<<') !== -1 || inner.indexOf('SEARCH') !== -1;",
             "        var safeInner = escapeHtml(inner);",
+            "        // Store in registry — safe against any special chars",
+            "        var patchIdx = _registerCode(match);  // full block with fences for patch",
+            "        var codeIdx  = _registerCode(inner);  // inner only for plain code",
             "        var blockHtml;",
-            "        var encodedInner = encodeURIComponent(inner);",
             "        if (isPatch) {",
-            "            var encodedMatch = encodeURIComponent(match);",
             "            blockHtml = '<div class=\"code-block patch\">' +",
             "                '<div class=\"code-header\"><span>\uD83D\uDCC4 ' + (lang || 'Patch') + '</span>' +",
-            "                '<button onclick=\"vscode.postMessage({type:\\'applyToActiveFile\\',value:decodeURIComponent(\\''+encodedMatch+'\\')})\">\u26A1 Appliquer</button>' +",
+            "                '<button onclick=\"_applyCode(' + patchIdx + ')\">\u26A1 Appliquer</button>' +",
             "                '</div><div class=\"code-content\">' + safeInner + '</div></div>';",
             "        } else {",
             "            blockHtml = '<div class=\"code-block\">' +",
             "                '<div class=\"code-header\"><span>' + (lang || 'code') + '</span>' +",
-            "                '<button onclick=\"(function(btn,txt){navigator.clipboard.writeText(txt).then(function(){btn.textContent=\\'\\u2713 Copi\\u00E9!\\';setTimeout(function(){btn.textContent=\\'Copier\\';},2000)});})(this,decodeURIComponent(\\''+encodedInner+'\\'))\">Copier</button>' +",
-            "                '<button onclick=\"vscode.postMessage({type:\\'applyToActiveFile\\',value:decodeURIComponent(\\''+encodedInner+'\\')})\">\u26A1 Appliquer</button>' +",
+            "                '<button onclick=\"_copyCode(this,' + codeIdx + ')\">Copier</button>' +",
+            "                '<button onclick=\"_applyCode(' + codeIdx + ')\">\u26A1 Appliquer</button>' +",
             "                '</div><div class=\"code-content\">' + safeInner + '</div></div>';",
             "        }",
             "        blocks.push(blockHtml);",
@@ -654,6 +691,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "}",
             "modelSelect.onchange = function() {",
             "    updateSelectColor();",
+            "    // Save full value (includes url||name for cloud models)",
             "    vscode.postMessage({ type: 'saveModel', model: modelSelect.value });",
             "};",
             "",
