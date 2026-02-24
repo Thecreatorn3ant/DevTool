@@ -7,6 +7,45 @@ export interface ApiKeyEntry {
     rateLimitedUntil?: number;
 }
 
+export interface ContextFile {
+    name: string;
+    content: string;
+    isActive?: boolean;
+}
+
+export interface TokenBudget {
+    used: number;
+    max: number;
+    isCloud: boolean;
+}
+
+export function estimateTokens(text: string): number {
+    return Math.ceil(text.length / 4);
+}
+
+const LOCAL_LIMITS: Record<string, number> = {
+    'llama3': 8000,
+    'llama3.1': 8000,
+    'llama3.2': 8000,
+    'codellama': 8000,
+    'mistral': 8000,
+    'mixtral': 16000,
+    'deepseek-coder': 8000,
+    'qwen2.5-coder': 8000,
+    'phi3': 4000,
+    'phi4': 8000,
+    'gemma': 4000,
+    'gemma2': 8000,
+};
+
+function getLocalMaxChars(model: string): number {
+    const modelLower = model.toLowerCase();
+    for (const [key, limit] of Object.entries(LOCAL_LIMITS)) {
+        if (modelLower.includes(key)) return limit * 4;
+    }
+    return 8000 * 4;
+}
+
 export class OllamaClient {
 
     private _getConfig() {
@@ -31,9 +70,12 @@ export class OllamaClient {
         const allKeys = this._getApiKeys();
         const now = Date.now();
 
-        const best = allKeys.find(k => k.key && (!k.platform || platform.includes(k.platform)) && (!k.rateLimitedUntil || k.rateLimitedUntil < now));
+        const best = allKeys.find(k =>
+            k.key &&
+            (!k.platform || platform.includes(k.platform)) &&
+            (!k.rateLimitedUntil || k.rateLimitedUntil < now)
+        );
         if (best) return best.key;
-
         return mainKey;
     }
 
@@ -42,15 +84,58 @@ export class OllamaClient {
         const now = Date.now();
         let changed = false;
         const updated = allKeys.map(k => {
-            if (k.key === key) {
-                changed = true;
-                return { ...k, rateLimitedUntil: now + 60000 };
-            }
+            if (k.key === key) { changed = true; return { ...k, rateLimitedUntil: now + 60000 }; }
             return k;
         });
-        if (changed) {
-            await this._saveApiKeys(updated);
+        if (changed) await this._saveApiKeys(updated);
+    }
+
+    isCloud(url?: string): boolean {
+        const u = url || this._getBaseUrl();
+        return !u.includes('localhost') && !u.includes('127.0.0.1');
+    }
+
+    getTokenBudget(model: string, targetUrl?: string): TokenBudget {
+        const cloud = this.isCloud(targetUrl);
+        if (cloud) {
+            return { used: 0, max: 100000 * 4, isCloud: true };
         }
+        const maxChars = getLocalMaxChars(model);
+        return { used: 0, max: maxChars, isCloud: false };
+    }
+
+    buildContext(
+        files: ContextFile[],
+        history: string,
+        model: string,
+        targetUrl?: string
+    ): { context: string; budget: TokenBudget } {
+        const budget = this.getTokenBudget(model, targetUrl);
+        const historyChars = history.length;
+        let remaining = budget.max - historyChars - 500;
+
+        const parts: string[] = [];
+
+        const activeFiles = files.filter(f => f.isActive);
+        const otherFiles = files.filter(f => !f.isActive);
+
+        for (const f of [...activeFiles, ...otherFiles]) {
+            if (remaining <= 0) break;
+            const header = `[FICHIER${f.isActive ? ' ACTIF' : ''}: ${f.name}]\n`;
+            const available = remaining - header.length;
+            if (available <= 100) break;
+
+            const truncated = f.content.length > available
+                ? f.content.substring(0, available) + '\n[... tronqué ...]'
+                : f.content;
+
+            parts.push(header + truncated);
+            remaining -= (header.length + truncated.length);
+        }
+
+        budget.used = budget.max - remaining;
+        const context = parts.join('\n\n');
+        return { context, budget };
     }
 
     async generateStreamingResponse(
@@ -71,16 +156,20 @@ export class OllamaClient {
         return await this._doRequestWithRetry(url, model, fullPrompt, onUpdate);
     }
 
-    private async _doRequestWithRetry(url: string, model: string, fullPrompt: string, onUpdate: (chunk: string) => void, attempt: number = 0): Promise<string> {
+    private async _doRequestWithRetry(
+        url: string,
+        model: string,
+        fullPrompt: string,
+        onUpdate: (chunk: string) => void,
+        attempt: number = 0
+    ): Promise<string> {
         const apiKey = this._getAvailableKey(url);
         const isOpenAI = this._isOpenAI(url);
         const systemPrompt = this._getSystemPrompt();
 
         try {
             const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-            if (apiKey) {
-                headers['Authorization'] = `Bearer ${apiKey}`;
-            }
+            if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
             if (url.includes('openrouter')) {
                 headers['HTTP-Referer'] = 'https://github.com/microsoft/vscode';
                 headers['X-Title'] = 'VSCode Antigravity';
@@ -111,7 +200,7 @@ export class OllamaClient {
             if (response.status === 429 && attempt < 3) {
                 if (apiKey) {
                     await this._markKeyAsRateLimited(apiKey);
-                    vscode.window.showWarningMessage("⏳ Rate Limit atteint sur ce compte. Basculement sur un autre disponible...");
+                    vscode.window.showWarningMessage("⏳ Rate Limit atteint. Basculement sur un autre compte...");
                     return this._doRequestWithRetry(url, model, fullPrompt, onUpdate, attempt + 1);
                 }
             }
@@ -146,19 +235,13 @@ export class OllamaClient {
                             try {
                                 const data = JSON.parse(cleanLine.slice(6));
                                 const content = data.choices?.[0]?.delta?.content;
-                                if (content) {
-                                    fullResponse += content;
-                                    onUpdate(content);
-                                }
-                            } catch (e) { /* ignore parse error */ }
+                                if (content) { fullResponse += content; onUpdate(content); }
+                            } catch { }
                         }
                     } else {
                         try {
                             const data = JSON.parse(cleanLine);
-                            if (data.response) {
-                                fullResponse += data.response;
-                                onUpdate(data.response);
-                            }
+                            if (data.response) { fullResponse += data.response; onUpdate(data.response); }
                             if (data.error) throw new Error(data.error);
                         } catch (e: any) {
                             if (e.message && !e.message.includes('JSON')) throw e;
@@ -202,13 +285,17 @@ export class OllamaClient {
 
 ━━━ COMPORTEMENT STRICT ABSOLU (SINON ÉCHEC) ━━━
 - RÉPONDRE EXCLUSIVEMENT EN FRANÇAIS.
-- Modifie UNIQUEMENT le vrai code fourni dans le contexte (la section [FICHIER ACTIF]).
-- Style robotique : PAS de salutations, PAS d'explications. Fournis directement le correctif.
+- Modifie UNIQUEMENT le vrai code fourni dans le contexte.
+- Style robotique : PAS de salutations, PAS d'explications inutiles. Fournis directement le correctif.
+- Si tu as besoin d'accéder à un fichier qui n'est PAS dans ton contexte, indique-le EXPLICITEMENT avec la balise : [NEED_FILE: chemin/du/fichier]
+- Si tu identifies plusieurs fichiers à modifier, liste-les TOUS avant de commencer avec : [WILL_MODIFY: fichier1, fichier2, ...]
+- Pour le mode "Réflexion", commence par un bloc [PLAN] qui liste toutes les modifications envisagées avant tout code.
 
 ━━━ FORMAT OBLIGATOIRE POUR MODIFIER UN FICHIER ━━━
-Toujours utiliser les blocs SEARCH/REPLACE. 
+Toujours utiliser les blocs SEARCH/REPLACE avec le fichier cible.
 
 \`\`\`typescript
+[FILE: nom_du_fichier.ts]
 <<<< SEARCH
 code_exact_existant
 ====
@@ -218,7 +305,8 @@ nouveau_code
 
 Règles :
 1. SEARCH doit être un copié-collé STRICT.
-2. Inclure 2 lignes de contexte avant et après.`;
+2. Inclure 2 lignes de contexte avant et après.
+3. Si tu crées un nouveau fichier : [CREATE_FILE: chemin] suivi du contenu complet.`;
     }
 
     async generateResponse(prompt: string, context: string = '', modelOverride?: string, targetUrl?: string): Promise<string> {
@@ -250,10 +338,10 @@ Règles :
         } catch { return []; }
     }
 
-    async listAllModels(): Promise<{ name: string, isLocal: boolean, url: string }[]> {
+    async listAllModels(): Promise<{ name: string; isLocal: boolean; url: string }[]> {
         const activeUrl = this._getBaseUrl();
         const config = this._getConfig();
-        const result: { name: string, isLocal: boolean, url: string }[] = [];
+        const result: { name: string; isLocal: boolean; url: string }[] = [];
 
         let localModels: string[] = [];
         try {
@@ -264,27 +352,28 @@ Règles :
             }
         } catch { }
 
-        let cloudModels: string[] = [];
-        if (!activeUrl.includes('localhost') && !activeUrl.includes('127.0.0.1')) {
+        const savedKeys: Array<{ name: string; key: string; url: string }> =
+            config.get<any[]>('apiKeys') || [];
+
+        for (const provider of savedKeys) {
             try {
-                const apiKey = this._getAvailableKey(activeUrl);
-                const headers: Record<string, string> = {};
-                if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-                const isOpenAI = this._isOpenAI(activeUrl);
-                const endpoint = isOpenAI ? `${activeUrl}/models` : `${activeUrl}/api/tags`;
-                const res = await fetch(endpoint, { headers, signal: AbortSignal.timeout(4000) });
+                const isOpenAI = this._isOpenAI(provider.url);
+                const endpoint = isOpenAI ? `${provider.url}/models` : `${provider.url}/api/tags`;
+                const res = await fetch(endpoint, {
+                    headers: { 'Authorization': `Bearer ${provider.key}` },
+                    signal: AbortSignal.timeout(4000)
+                });
                 if (res.ok) {
                     const data: any = await res.json();
-                    cloudModels = isOpenAI
-                        ? (data?.data || []).map((m: any) => m.id).filter(Boolean)
-                        : (data?.models || []).map((m: any) => m.name).filter(Boolean);
+                    const cloudList: string[] = isOpenAI
+                        ? (data?.data || []).map((m: any) => m.id as string).filter(Boolean)
+                        : (data?.models || []).map((m: any) => (m.name ?? m.id) as string).filter(Boolean);
+                    cloudList.forEach(m => result.push({ name: m, isLocal: false, url: provider.url }));
                 }
             } catch { }
         }
 
-        for (const m of cloudModels) result.push({ name: m, isLocal: false, url: activeUrl });
         for (const m of localModels) result.push({ name: m, isLocal: true, url: 'http://localhost:11434' });
-
         return result;
     }
 
