@@ -1,7 +1,7 @@
 ﻿import * as vscode from 'vscode';
 import * as path from 'path';
 import * as os from 'os';
-import { OllamaClient, ContextFile, estimateTokens } from './ollamaClient';
+import { OllamaClient, ContextFile, ApiKeyStatus, estimateTokens } from './ollamaClient';
 import { FileContextManager } from './fileContextManager';
 
 interface ChatMessage {
@@ -552,50 +552,227 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async _handleCloudConnection() {
-        const config = vscode.workspace.getConfiguration('local-ai');
-        const apiKeys: Array<{ name: string; key: string; url: string; expiresAt?: number }> =
-            config.get<any[]>('apiKeys') || [];
+        await this._showKeyManagerMenu();
+    }
 
-        interface QuickPickItemWithKey extends vscode.QuickPickItem {
-            keyEntry?: { name: string; key: string; url: string; expiresAt?: number };
+    private async _showKeyManagerMenu() {
+        interface KeyMenuItem extends vscode.QuickPickItem {
+            action: 'select' | 'add' | 'manage';
+            keyIdx?: number;
         }
 
-        const now = Date.now();
-        const items: QuickPickItemWithKey[] = [
-            ...apiKeys.map(k => ({
-                label: `☁️  ${k.name}`,
-                description: k.url,
-                detail: k.expiresAt
-                    ? (k.expiresAt < now ? '⚠️ Clé expirée' : `Expire ${new Date(k.expiresAt).toLocaleDateString()}`)
-                    : undefined,
-                keyEntry: k
-            })),
-            { label: '$(add) Ajouter une clé API Cloud', description: 'Configurer un nouveau provider' }
+        const statuses = this._ollamaClient.getApiKeyStatuses();
+
+        const keyItems: KeyMenuItem[] = statuses.map((s, i) => ({
+            label: `${s.statusIcon} ${s.entry.name}`,
+            description: s.entry.url,
+            detail: `${s.statusLabel}${s.cooldownSecsLeft ? '' : ''}  ·  Ajouté ${s.entry.addedAt ? new Date(s.entry.addedAt).toLocaleDateString('fr-FR') : 'N/A'}`,
+            action: 'select',
+            keyIdx: i,
+        }));
+
+        const items: KeyMenuItem[] = [
+            ...keyItems,
+            { label: '', kind: vscode.QuickPickItemKind.Separator } as any,
+            {
+                label: '$(add)  Ajouter une clé API',
+                description: 'Configurer un nouveau provider cloud',
+                action: 'add',
+            },
+            {
+                label: '$(gear)  Gérer les clés existantes',
+                description: 'Modifier / Supprimer / Réinitialiser le cooldown',
+                action: 'manage',
+            },
         ];
 
         const picked = await vscode.window.showQuickPick(items, {
-            title: 'Connexion Cloud',
-            placeHolder: 'Sélectionner un compte ou en ajouter un'
+            title: '☁️ Gestion des clés API Cloud',
+            placeHolder: statuses.length === 0
+                ? 'Aucune clé configurée — ajoutez-en une'
+                : 'Sélectionner un compte ou gérer les clés',
+            matchOnDescription: true,
+            matchOnDetail: false,
         });
         if (!picked) return;
 
-        if (picked.keyEntry) {
-            await this._updateModelsList(picked.keyEntry.url, picked.keyEntry.key);
-        } else {
-            const name = await vscode.window.showInputBox({ prompt: 'Nom du provider (ex: OpenAI, Mistral…)' });
-            if (!name) return;
-            const url = await vscode.window.showInputBox({
-                prompt: "URL de base de l'API",
-                value: 'https://api.openai.com/v1'
-            });
-            if (!url) return;
-            const key = await vscode.window.showInputBox({ prompt: 'Clé API', password: true });
-            if (!key) return;
+        if (picked.action === 'add') {
+            await this._handleAddKey();
+        } else if (picked.action === 'manage') {
+            await this._handleManageKeys();
+        } else if (picked.action === 'select' && picked.keyIdx !== undefined) {
+            const entry = statuses[picked.keyIdx].entry;
+            const status = statuses[picked.keyIdx];
+            if (status.status === 'cooldown') {
+                const choice = await vscode.window.showWarningMessage(
+                    `⚠️ "${entry.name}" est en cooldown encore ${status.cooldownSecsLeft}s. Utiliser quand même ?`,
+                    'Utiliser quand même', 'Réinitialiser le cooldown', 'Annuler'
+                );
+                if (!choice || choice === 'Annuler') return;
+                if (choice === 'Réinitialiser le cooldown') {
+                    await this._ollamaClient.resetKeyCooldown(entry.key, entry.url);
+                    vscode.window.showInformationMessage(`✅ Cooldown réinitialisé pour "${entry.name}".`);
+                }
+            }
+            await this._updateModelsList(entry.url, entry.key);
+        }
+    }
 
-            const updated = [...apiKeys, { name, url, key }];
-            await config.update('apiKeys', updated, vscode.ConfigurationTarget.Global);
-            vscode.window.showInformationMessage(`✅ Provider "${name}" ajouté.`);
-            await this._updateModelsList(url, key);
+    private async _handleAddKey() {
+        const name = await vscode.window.showInputBox({
+            title: 'Ajouter une clé API — 1/3',
+            prompt: 'Nom du provider',
+            placeHolder: 'ex: OpenAI perso, OpenRouter compte 2, Mistral…',
+            ignoreFocusOut: true,
+        });
+        if (!name) return;
+
+        const PRESET_URLS = [
+            { label: 'OpenAI', description: 'https://api.openai.com/v1' },
+            { label: 'OpenRouter', description: 'https://openrouter.ai/api/v1' },
+            { label: 'Together AI', description: 'https://api.together.xyz/v1' },
+            { label: 'Mistral', description: 'https://api.mistral.ai/v1' },
+            { label: 'Groq', description: 'https://api.groq.com/openai/v1' },
+            { label: 'Autre / Personnalisé…', description: '' },
+        ];
+
+        const urlPick = await vscode.window.showQuickPick(PRESET_URLS, {
+            title: 'Ajouter une clé API — 2/3',
+            placeHolder: 'Choisir le provider ou entrer une URL personnalisée',
+        });
+        if (!urlPick) return;
+
+        let url = urlPick.description;
+        if (!url) {
+            const custom = await vscode.window.showInputBox({
+                title: 'URL de base de l\'API',
+                prompt: 'URL de base de l\'API (sans slash final)',
+                placeHolder: 'https://mon-serveur.com/v1',
+                ignoreFocusOut: true,
+            });
+            if (!custom) return;
+            url = custom;
+        }
+
+        const key = await vscode.window.showInputBox({
+            title: 'Ajouter une clé API — 3/3',
+            prompt: `Clé API pour "${name}"`,
+            placeHolder: 'sk-…',
+            password: true,
+            ignoreFocusOut: true,
+        });
+        if (!key) return;
+
+        const result = await this._ollamaClient.addApiKey({ name, url, key });
+        if (!result.success) {
+            vscode.window.showWarningMessage(`⚠️ ${result.reason}`);
+            return;
+        }
+
+        vscode.window.showInformationMessage(`✅ Clé "${name}" ajoutée avec succès.`);
+        await this._updateModelsList(url, key);
+    }
+
+    private async _handleManageKeys() {
+        const statuses = this._ollamaClient.getApiKeyStatuses();
+        if (statuses.length === 0) {
+            const addNow = await vscode.window.showInformationMessage(
+                'Aucune clé configurée. Ajouter une clé ?', 'Ajouter', 'Annuler'
+            );
+            if (addNow === 'Ajouter') await this._handleAddKey();
+            return;
+        }
+
+        interface ManageItem extends vscode.QuickPickItem {
+            statusIdx: number;
+        }
+
+        const items: ManageItem[] = statuses.map((s, i) => ({
+            label: `${s.statusIcon} ${s.entry.name}`,
+            description: s.entry.url,
+            detail: s.statusLabel + (s.entry.key ? `  ·  Clé: ${s.entry.key.substring(0, 8)}${'·'.repeat(8)}` : ''),
+            statusIdx: i,
+        }));
+
+        const picked = await vscode.window.showQuickPick(items, {
+            title: '🔑 Gérer les clés — Sélectionner une clé',
+            placeHolder: 'Choisir la clé à modifier',
+        });
+        if (!picked) return;
+
+        const target = statuses[picked.statusIdx];
+        await this._handleKeyActions(target);
+    }
+
+    private async _handleKeyActions(target: ApiKeyStatus) {
+        const entry = target.entry;
+        const actions: vscode.QuickPickItem[] = [
+            {
+                label: '✏️  Renommer',
+                description: `Nom actuel : "${entry.name}"`,
+            },
+            {
+                label: '🔑  Changer la clé API',
+                description: `Clé actuelle : ${entry.key.substring(0, 8)}·····`,
+            },
+            ...(target.status === 'cooldown' ? [{
+                label: '🔄  Réinitialiser le cooldown',
+                description: `Restant : ${target.cooldownSecsLeft}s`,
+            }] : []),
+            {
+                label: '🗑️  Supprimer cette clé',
+                description: `"${entry.name}" — ${entry.url}`,
+            },
+            {
+                label: '↩️  Retour',
+            },
+        ];
+
+        const action = await vscode.window.showQuickPick(actions, {
+            title: `⚙️ Actions — ${entry.name}`,
+        });
+        if (!action || action.label === '↩️  Retour') {
+            await this._handleManageKeys();
+            return;
+        }
+
+        if (action.label.startsWith('✏️')) {
+            const newName = await vscode.window.showInputBox({
+                prompt: 'Nouveau nom',
+                value: entry.name,
+                ignoreFocusOut: true,
+            });
+            if (!newName || newName === entry.name) return;
+            await this._ollamaClient.updateApiKey(entry.key, entry.url, { name: newName });
+            vscode.window.showInformationMessage(`✅ Renommé en "${newName}".`);
+
+        } else if (action.label.startsWith('🔑')) {
+            const newKey = await vscode.window.showInputBox({
+                prompt: `Nouvelle clé API pour "${entry.name}"`,
+                placeHolder: 'sk-…',
+                password: true,
+                ignoreFocusOut: true,
+            });
+            if (!newKey) return;
+            await this._ollamaClient.deleteApiKey(entry.key, entry.url);
+            await this._ollamaClient.addApiKey({ name: entry.name, url: entry.url, key: newKey, platform: entry.platform });
+            vscode.window.showInformationMessage(`✅ Clé mise à jour pour "${entry.name}".`);
+            await this._updateModelsList(entry.url, newKey);
+
+        } else if (action.label.startsWith('🔄')) {
+            await this._ollamaClient.resetKeyCooldown(entry.key, entry.url);
+            vscode.window.showInformationMessage(`✅ Cooldown réinitialisé — "${entry.name}" est disponible.`);
+
+        } else if (action.label.startsWith('🗑️')) {
+            const confirm = await vscode.window.showWarningMessage(
+                `Supprimer la clé "${entry.name}" ? Cette action est irréversible.`,
+                { modal: true },
+                '🗑️ Supprimer', 'Annuler'
+            );
+            if (confirm !== '🗑️ Supprimer') return;
+            await this._ollamaClient.deleteApiKey(entry.key, entry.url);
+            vscode.window.showInformationMessage(`🗑️ Clé "${entry.name}" supprimée.`);
+            await this._updateModelsList();
         }
     }
 
@@ -603,6 +780,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (!this._view) return;
 
         try {
+            const savedKeys = this._ollamaClient.getApiKeys();
+            const tmpKey = cloudUrl && cloudKey && !savedKeys.find(k => k.url === cloudUrl && k.key === cloudKey)
+                ? { name: 'Cloud', url: cloudUrl, key: cloudKey }
+                : undefined;
+
             const allModels = await this._ollamaClient.listAllModels();
             const formattedModels: Array<{
                 label: string; value: string; name: string; url: string; isLocal: boolean;
@@ -614,21 +796,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 isLocal: m.isLocal
             }));
 
-            const config = vscode.workspace.getConfiguration('local-ai');
-            const savedKeys: Array<{ name: string; key: string; url: string }> =
-                config.get<any[]>('apiKeys') || [];
-
-            const providersToFetch = [...savedKeys];
-            if (cloudUrl && cloudKey && !providersToFetch.find(k => k.url === cloudUrl)) {
-                providersToFetch.push({ name: 'Cloud', url: cloudUrl, key: cloudKey });
-            }
-
-            for (const provider of providersToFetch) {
+            if (tmpKey) {
                 try {
-                    const isOpenAI = provider.url.includes('together') || provider.url.includes('openrouter') || provider.url.endsWith('/v1');
-                    const endpoint = isOpenAI ? `${provider.url}/models` : `${provider.url}/api/tags`;
+                    const isOpenAI = tmpKey.url.includes('together') || tmpKey.url.includes('openrouter') || tmpKey.url.endsWith('/v1');
+                    const endpoint = isOpenAI ? `${tmpKey.url}/models` : `${tmpKey.url}/api/tags`;
                     const res = await fetch(endpoint, {
-                        headers: { 'Authorization': `Bearer ${provider.key}` },
+                        headers: { 'Authorization': `Bearer ${tmpKey.key}` },
                         signal: AbortSignal.timeout(4000)
                     });
                     if (res.ok) {
@@ -637,15 +810,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             ? (data?.data || []).map((m: any) => m.id as string).filter(Boolean)
                             : (data?.models || []).map((m: any) => (m.name ?? m.id) as string).filter(Boolean);
                         cloudList.forEach(m => {
-                            const val = `${provider.url}||${m}`;
+                            const val = `${tmpKey.url}||${m}`;
                             if (!formattedModels.find(x => x.value === val)) {
-                                formattedModels.push({
-                                    label: `☁️  ${m}`,
-                                    value: val,
-                                    name: m,
-                                    url: provider.url,
-                                    isLocal: false
-                                });
+                                formattedModels.push({ label: `☁️  ${m}`, value: val, name: m, url: tmpKey.url, isLocal: false });
                             }
                         });
                     }

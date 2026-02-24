@@ -2,9 +2,20 @@ import * as vscode from 'vscode';
 
 export interface ApiKeyEntry {
     key: string;
-    label: string;
+    name: string;
+    url: string;
     platform?: string;
     rateLimitedUntil?: number;
+    addedAt?: number;
+}
+
+export type ApiKeyStatusCode = 'available' | 'cooldown' | 'no-key';
+export interface ApiKeyStatus {
+    entry: ApiKeyEntry;
+    status: ApiKeyStatusCode;
+    cooldownSecsLeft?: number;
+    statusIcon: string;
+    statusLabel: string;
 }
 
 export interface ContextFile {
@@ -46,6 +57,20 @@ function getLocalMaxChars(model: string): number {
     return 8000 * 4;
 }
 
+function migrateKeyEntry(raw: any): ApiKeyEntry | null {
+    if (!raw || typeof raw !== 'object') return null;
+    const key = raw.key || '';
+    if (!key) return null;
+    return {
+        key,
+        name: raw.name || raw.label || 'Clé sans nom',
+        url: raw.url || '',
+        platform: raw.platform,
+        rateLimitedUntil: raw.rateLimitedUntil,
+        addedAt: raw.addedAt || Date.now(),
+    };
+}
+
 export class OllamaClient {
 
     private _getConfig() {
@@ -56,35 +81,101 @@ export class OllamaClient {
         return this._getConfig().get<string>('ollamaUrl') || 'http://localhost:11434';
     }
 
-    private _getApiKeys(): ApiKeyEntry[] {
-        return this._getConfig().get<ApiKeyEntry[]>('apiKeys') || [];
+    getApiKeys(): ApiKeyEntry[] {
+        const raw = this._getConfig().get<any[]>('apiKeys') || [];
+        return raw.map(migrateKeyEntry).filter((k): k is ApiKeyEntry => k !== null);
     }
 
-    private async _saveApiKeys(keys: ApiKeyEntry[]) {
-        await this._getConfig().update('apiKeys', keys, true);
+    private async _saveApiKeys(keys: ApiKeyEntry[]): Promise<void> {
+        await this._getConfig().update('apiKeys', keys, vscode.ConfigurationTarget.Global);
     }
 
-    private _getAvailableKey(platform: string): string {
-        const config = this._getConfig();
-        const mainKey = config.get<string>('apiKey') || '';
-        const allKeys = this._getApiKeys();
+    async addApiKey(entry: Omit<ApiKeyEntry, 'addedAt'>): Promise<{ success: boolean; reason?: string }> {
+        const keys = this.getApiKeys();
+        if (keys.find(k => k.key === entry.key && k.url === entry.url)) {
+            return { success: false, reason: 'Cette clé existe déjà pour ce provider.' };
+        }
+        keys.push({ ...entry, addedAt: Date.now() });
+        await this._saveApiKeys(keys);
+        return { success: true };
+    }
+
+    async updateApiKey(
+        keyValue: string,
+        url: string,
+        updates: Partial<Omit<ApiKeyEntry, 'key' | 'addedAt'>>
+    ): Promise<void> {
+        const keys = this.getApiKeys();
+        const idx = keys.findIndex(k => k.key === keyValue && k.url === url);
+        if (idx === -1) return;
+        keys[idx] = { ...keys[idx], ...updates };
+        await this._saveApiKeys(keys);
+    }
+
+    async deleteApiKey(keyValue: string, url: string): Promise<void> {
+        const keys = this.getApiKeys().filter(k => !(k.key === keyValue && k.url === url));
+        await this._saveApiKeys(keys);
+    }
+
+    async resetKeyCooldown(keyValue: string, url: string): Promise<void> {
+        const keys = this.getApiKeys();
+        const idx = keys.findIndex(k => k.key === keyValue && k.url === url);
+        if (idx === -1) return;
+        delete keys[idx].rateLimitedUntil;
+        await this._saveApiKeys(keys);
+    }
+
+
+    getApiKeyStatuses(): ApiKeyStatus[] {
+        const now = Date.now();
+        return this.getApiKeys().map(entry => {
+            if (!entry.key) {
+                return { entry, status: 'no-key' as ApiKeyStatusCode, statusIcon: '🔴', statusLabel: 'Pas de clé' };
+            }
+            if (entry.rateLimitedUntil && entry.rateLimitedUntil > now) {
+                const secsLeft = Math.ceil((entry.rateLimitedUntil - now) / 1000);
+                return {
+                    entry,
+                    status: 'cooldown' as ApiKeyStatusCode,
+                    cooldownSecsLeft: secsLeft,
+                    statusIcon: '🟡',
+                    statusLabel: `Cooldown ${secsLeft}s`,
+                };
+            }
+            return { entry, status: 'available' as ApiKeyStatusCode, statusIcon: '🟢', statusLabel: 'Disponible' };
+        });
+    }
+
+
+    private _getAvailableKey(targetUrl: string): { key: string; entry?: ApiKeyEntry } {
+        const keys = this.getApiKeys();
         const now = Date.now();
 
-        const best = allKeys.find(k =>
-            k.key &&
-            (!k.platform || platform.includes(k.platform)) &&
+        const exact = keys.find(k =>
+            k.url && targetUrl.startsWith(k.url.replace(/\/+$/, '')) &&
             (!k.rateLimitedUntil || k.rateLimitedUntil < now)
         );
-        if (best) return best.key;
-        return mainKey;
+        if (exact) return { key: exact.key, entry: exact };
+
+        const platformMatch = keys.find(k =>
+            k.platform && targetUrl.includes(k.platform) &&
+            (!k.rateLimitedUntil || k.rateLimitedUntil < now)
+        );
+        if (platformMatch) return { key: platformMatch.key, entry: platformMatch };
+
+        const legacyKey = this._getConfig().get<string>('apiKey') || '';
+        return { key: legacyKey };
     }
 
-    private async _markKeyAsRateLimited(key: string) {
-        const allKeys = this._getApiKeys();
+    private async _markKeyAsRateLimited(keyValue: string, url: string, keyName?: string): Promise<void> {
+        const keys = this.getApiKeys();
         const now = Date.now();
         let changed = false;
-        const updated = allKeys.map(k => {
-            if (k.key === key) { changed = true; return { ...k, rateLimitedUntil: now + 60000 }; }
+        const updated = keys.map(k => {
+            if (k.key === keyValue && k.url === url) {
+                changed = true;
+                return { ...k, rateLimitedUntil: now + 60_000 };
+            }
             return k;
         });
         if (changed) await this._saveApiKeys(updated);
@@ -163,7 +254,7 @@ export class OllamaClient {
         onUpdate: (chunk: string) => void,
         attempt: number = 0
     ): Promise<string> {
-        const apiKey = this._getAvailableKey(url);
+        const { key: apiKey, entry: keyEntry } = this._getAvailableKey(url);
         const isOpenAI = this._isOpenAI(url);
         const systemPrompt = this._getSystemPrompt();
 
@@ -198,9 +289,15 @@ export class OllamaClient {
             });
 
             if (response.status === 429 && attempt < 3) {
-                if (apiKey) {
-                    await this._markKeyAsRateLimited(apiKey);
-                    vscode.window.showWarningMessage("⏳ Rate Limit atteint. Basculement sur un autre compte...");
+                if (apiKey && keyEntry) {
+                    await this._markKeyAsRateLimited(apiKey, keyEntry.url, keyEntry.name);
+                    vscode.window.showWarningMessage(
+                        `⏳ Rate Limit — "${keyEntry.name}" est en cooldown 60s. Bascule automatique sur la prochaine clé disponible...`
+                    );
+                    return this._doRequestWithRetry(url, model, fullPrompt, onUpdate, attempt + 1);
+                } else {
+                    vscode.window.showWarningMessage('⏳ Rate Limit atteint. Attente 5s avant de réessayer...');
+                    await new Promise(r => setTimeout(r, 5000));
                     return this._doRequestWithRetry(url, model, fullPrompt, onUpdate, attempt + 1);
                 }
             }
@@ -311,7 +408,8 @@ Règles :
 
     async generateResponse(prompt: string, context: string = '', modelOverride?: string, targetUrl?: string): Promise<string> {
         let full = '';
-        return await this.generateStreamingResponse(prompt, context, (c) => { full += c; }, modelOverride, targetUrl);
+        await this.generateStreamingResponse(prompt, context, (c) => { full += c; }, modelOverride, targetUrl);
+        return full;
     }
 
     private _isOpenAI(url: string): boolean {
@@ -320,7 +418,7 @@ Règles :
 
     async listModels(): Promise<string[]> {
         const url = this._getBaseUrl();
-        const apiKey = this._getAvailableKey(url);
+        const { key: apiKey } = this._getAvailableKey(url);
         const headers: Record<string, string> = {};
         if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
 
@@ -330,37 +428,34 @@ Règles :
             const response = await fetch(endpoint, { headers, signal: AbortSignal.timeout(5000) });
             if (!response.ok) return [];
             const data: any = await response.json();
-            if (isOpenAI) {
-                return (data?.data || []).map((m: any) => m.id).filter(Boolean);
-            } else {
-                return (data?.models || []).map((m: any) => m.name).filter(Boolean);
-            }
+            return isOpenAI
+                ? (data?.data || []).map((m: any) => m.id).filter(Boolean)
+                : (data?.models || []).map((m: any) => m.name).filter(Boolean);
         } catch { return []; }
     }
 
     async listAllModels(): Promise<{ name: string; isLocal: boolean; url: string }[]> {
-        const activeUrl = this._getBaseUrl();
-        const config = this._getConfig();
         const result: { name: string; isLocal: boolean; url: string }[] = [];
 
-        let localModels: string[] = [];
         try {
             const res = await fetch('http://localhost:11434/api/tags', { signal: AbortSignal.timeout(2000) });
             if (res.ok) {
                 const data: any = await res.json();
-                localModels = (data?.models || []).map((m: any) => m.name).filter(Boolean);
+                const localModels: string[] = (data?.models || []).map((m: any) => m.name).filter(Boolean);
+                for (const m of localModels) {
+                    result.push({ name: m, isLocal: true, url: 'http://localhost:11434' });
+                }
             }
         } catch { }
 
-        const savedKeys: Array<{ name: string; key: string; url: string }> =
-            config.get<any[]>('apiKeys') || [];
-
-        for (const provider of savedKeys) {
+        const savedKeys = this.getApiKeys();
+        for (const entry of savedKeys) {
+            if (!entry.key || !entry.url) continue;
             try {
-                const isOpenAI = this._isOpenAI(provider.url);
-                const endpoint = isOpenAI ? `${provider.url}/models` : `${provider.url}/api/tags`;
+                const isOpenAI = this._isOpenAI(entry.url);
+                const endpoint = isOpenAI ? `${entry.url}/models` : `${entry.url}/api/tags`;
                 const res = await fetch(endpoint, {
-                    headers: { 'Authorization': `Bearer ${provider.key}` },
+                    headers: { 'Authorization': `Bearer ${entry.key}` },
                     signal: AbortSignal.timeout(4000)
                 });
                 if (res.ok) {
@@ -368,18 +463,17 @@ Règles :
                     const cloudList: string[] = isOpenAI
                         ? (data?.data || []).map((m: any) => m.id as string).filter(Boolean)
                         : (data?.models || []).map((m: any) => (m.name ?? m.id) as string).filter(Boolean);
-                    cloudList.forEach(m => result.push({ name: m, isLocal: false, url: provider.url }));
+                    cloudList.forEach(m => result.push({ name: m, isLocal: false, url: entry.url }));
                 }
             } catch { }
         }
 
-        for (const m of localModels) result.push({ name: m, isLocal: true, url: 'http://localhost:11434' });
         return result;
     }
 
     async checkConnection(): Promise<boolean> {
         const url = this._getBaseUrl();
-        const apiKey = this._getAvailableKey(url);
+        const { key: apiKey } = this._getAvailableKey(url);
         const headers: Record<string, string> = {};
         if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
         try {
