@@ -438,34 +438,63 @@ Règles :
 
     async listAllModels(): Promise<{ name: string; isLocal: boolean; url: string }[]> {
         const result: { name: string; isLocal: boolean; url: string }[] = [];
+        const seen = new Set<string>();
 
+        const LOCAL_URL = 'http://localhost:11434';
         try {
-            const res = await fetch('http://localhost:11434/api/tags', { signal: AbortSignal.timeout(2000) });
+            const res = await fetch(`${LOCAL_URL}/api/tags`, { signal: AbortSignal.timeout(2000) });
             if (res.ok) {
                 const data: any = await res.json();
-                const localModels: string[] = (data?.models || []).map((m: any) => m.name).filter(Boolean);
-                for (const m of localModels) {
-                    result.push({ name: m, isLocal: true, url: 'http://localhost:11434' });
+                for (const m of (data?.models || []).map((x: any) => x.name).filter(Boolean)) {
+                    const key = `${LOCAL_URL}||${m}`;
+                    if (!seen.has(key)) { seen.add(key); result.push({ name: m, isLocal: true, url: LOCAL_URL }); }
                 }
             }
         } catch { }
 
-        const savedKeys = this.getApiKeys();
-        for (const entry of savedKeys) {
-            if (!entry.url) continue;
-            if (entry.url.includes('localhost') || entry.url.includes('127.0.0.1')) continue;
+        const configuredUrl = this._getBaseUrl().replace(/\/+$/, '');
+        if (configuredUrl !== LOCAL_URL && configuredUrl !== 'http://127.0.0.1:11434') {
             try {
-                const isOpenAI = this._isOpenAI(entry.url);
-                const endpoint = isOpenAI ? `${entry.url}/models` : `${entry.url}/api/tags`;
+                const isOpenAI = this._isOpenAI(configuredUrl);
+                const endpoint = isOpenAI ? `${configuredUrl}/models` : `${configuredUrl}/api/tags`;
+                const { key } = this._getAvailableKey(configuredUrl);
+                const headers: Record<string, string> = {};
+                if (key) headers['Authorization'] = `Bearer ${key}`;
+                const res = await fetch(endpoint, { headers, signal: AbortSignal.timeout(4000) });
+                if (res.ok) {
+                    const data: any = await res.json();
+                    const list: string[] = isOpenAI
+                        ? (data?.data || []).map((m: any) => m.id as string).filter(Boolean)
+                        : (data?.models || []).map((m: any) => (m.name ?? m.id) as string).filter(Boolean);
+                    for (const m of list) {
+                        const k = `${configuredUrl}||${m}`;
+                        if (!seen.has(k)) { seen.add(k); result.push({ name: m, isLocal: false, url: configuredUrl }); }
+                    }
+                }
+            } catch { }
+        }
+
+        for (const entry of this.getApiKeys()) {
+            if (!entry.url) continue;
+            const baseUrl = entry.url.replace(/\/+$/, '');
+            const alreadyDoneAsLocal = (baseUrl === LOCAL_URL || baseUrl === 'http://127.0.0.1:11434') && !entry.key;
+            if (alreadyDoneAsLocal) continue;
+            try {
+                const isOpenAI = this._isOpenAI(baseUrl);
+                const endpoint = isOpenAI ? `${baseUrl}/models` : `${baseUrl}/api/tags`;
                 const fetchHeaders: Record<string, string> = {};
                 if (entry.key) fetchHeaders['Authorization'] = `Bearer ${entry.key}`;
                 const res = await fetch(endpoint, { headers: fetchHeaders, signal: AbortSignal.timeout(4000) });
                 if (res.ok) {
                     const data: any = await res.json();
-                    const cloudList: string[] = isOpenAI
+                    const list: string[] = isOpenAI
                         ? (data?.data || []).map((m: any) => m.id as string).filter(Boolean)
                         : (data?.models || []).map((m: any) => (m.name ?? m.id) as string).filter(Boolean);
-                    cloudList.forEach(m => result.push({ name: m, isLocal: false, url: entry.url }));
+                    for (const m of list) {
+                        const k = `${baseUrl}||${m}`;
+                        const isLocal = !entry.key && (baseUrl === LOCAL_URL || baseUrl === 'http://127.0.0.1:11434');
+                        if (!seen.has(k)) { seen.add(k); result.push({ name: m, isLocal, url: baseUrl }); }
+                    }
                 }
             } catch { }
         }
