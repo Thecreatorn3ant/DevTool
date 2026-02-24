@@ -22,7 +22,17 @@ class AiPreviewProvider implements vscode.TextDocumentContentProvider {
         this._content.delete(uri.toString());
     }
     provideTextDocumentContent(uri: vscode.Uri): string {
-        return this._content.get(uri.toString()) ?? '';
+        const uriStr = uri.toString();
+        if (this._content.has(uriStr)) {
+            return this._content.get(uriStr)!;
+        }
+        const lowerUri = uriStr.toLowerCase();
+        for (const [key, value] of this._content.entries()) {
+            if (key.toLowerCase() === lowerUri) {
+                return value;
+            }
+        }
+        return '';
     }
 }
 
@@ -34,6 +44,7 @@ function applySearchReplace(
     let patchCount = 0;
 
     const norm = (s: string) => s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const isCrLf = documentText.includes('\r\n');
     const docNorm = norm(documentText);
     const patchNorm = norm(patchContent);
 
@@ -85,7 +96,8 @@ function applySearchReplace(
         const searchTrimmed = trimEnd(search);
         const workingTrimmed = trimEnd(workingText);
         if (workingTrimmed.includes(searchTrimmed)) {
-            workingText = workingTrimmed.replace(searchTrimmed, replace);
+            const tempDoc = workingText.split('\n').map(l => l.trimEnd()).join('\n');
+            workingText = tempDoc.replace(searchTrimmed, replace);
             patchCount++;
             continue;
         }
@@ -121,7 +133,11 @@ function applySearchReplace(
         }
     }
 
-    return { result: workingText, patchCount, errors };
+    let result = workingText;
+    if (isCrLf) {
+        result = result.replace(/\n/g, '\r\n');
+    }
+    return { result, patchCount, errors };
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
