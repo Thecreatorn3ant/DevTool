@@ -668,8 +668,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         const PRESET_URLS: UrlPreset[] = [
             {
-                label: '⚡ Ollama distant (sans clé)', description: '', needsKey: false,
-                detail: 'Serveur Ollama auto-hébergé ou cloud — clé non requise'
+                label: '☁️ Ollama Cloud (ollama.com)',
+                description: 'https://api.ollama.com',
+                needsKey: true,
+                detail: 'Clé API sur ollama.com/settings — modèles hébergés par Ollama'
+            },
+            {
+                label: '⚡ Ollama auto-hébergé (sans clé)',
+                description: '',
+                needsKey: false,
+                detail: 'Serveur Ollama local ou VPS — clé non requise'
             },
             { label: 'OpenAI', description: 'https://api.openai.com/v1', needsKey: true },
             { label: 'OpenRouter', description: 'https://openrouter.ai/api/v1', needsKey: true },
@@ -706,12 +714,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         const keyRequired = urlPick.needsKey;
+        const isOllamaCloud = urlPick.label.startsWith('☁️ Ollama Cloud');
         const key = await vscode.window.showInputBox({
             title: 'Ajouter un provider — 3/3',
             prompt: keyRequired
                 ? `Clé API pour "${name}"`
                 : `Clé API pour "${name}" (optionnelle — laisser vide si Ollama sans auth)`,
-            placeHolder: keyRequired ? 'sk-…' : '(optionnel)',
+            placeHolder: isOllamaCloud ? 'Clé sur ollama.com/settings' : keyRequired ? 'sk-…' : '(optionnel)',
             password: true,
             ignoreFocusOut: true,
         });
@@ -1167,32 +1176,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "    return (icons[p]||'☁️')+' <b>'+(labels[p]||'Cloud')+'</b> &mdash; '+name;",
             "}",
             "",
-            "// ─── Model search (live filter) ───",
+            "// ─── Model search ───",
             "var modelSearch = document.getElementById('modelSearch');",
-            "var modelClear = document.getElementById('modelClear');",
-            "modelSearch.addEventListener('input', function() {",
-            "    modelClear.classList.toggle('visible', modelSearch.value.length > 0);",
-            "    renderModelOptions(_allModels, modelSelect.value);",
-            "});",
-            "modelSearch.addEventListener('keydown', function(e) {",
-            "    if (e.key === 'Escape') { modelSearch.value = ''; modelClear.classList.remove('visible'); renderModelOptions(_allModels, modelSelect.value); modelSearch.blur(); }",
-            "    if (e.key === 'Enter') { modelSearch.blur(); }",
-            "});",
-            "modelClear.onclick = function() {",
-            "    modelSearch.value = '';",
-            "    modelClear.classList.remove('visible');",
-            "    renderModelOptions(_allModels, modelSelect.value);",
-            "    modelSearch.focus();",
+            "var btnModelSearch = document.getElementById('btnModelSearch');",
+            "btnModelSearch.onclick = function() {",
+            "    modelSearch.classList.toggle('open');",
+            "    if (modelSearch.classList.contains('open')) { modelSearch.focus(); }",
+            "    else { modelSearch.value = ''; renderModelOptions(_allModels, modelSelect.value); }",
             "};",
+            "modelSearch.addEventListener('input', function() { renderModelOptions(_allModels, modelSelect.value); });",
+            "modelSearch.addEventListener('keydown', function(e) {",
+            "    if (e.key === 'Escape') { modelSearch.value = ''; modelSearch.classList.remove('open'); renderModelOptions(_allModels, modelSelect.value); }",
+            "});",
             "function renderModelOptions(models, selectedVal) {",
             "    var filter = modelSearch.value.toLowerCase().trim();",
             "    var filtered = filter ? models.filter(function(x) { return x.name.toLowerCase().includes(filter) || (x.provider||'').toLowerCase().includes(filter); }) : models;",
             "    if (filtered.length === 0) { modelSelect.innerHTML = '<option value=\"\" style=\"color:#666\">Aucun résultat</option>'; updateSelectColor(); return; }",
-            "    // Keep selection if still in results, else select first",
-            "    var keepVal = filtered.find(function(x) { return x.value === selectedVal; }) ? selectedVal : filtered[0].value;",
             "    modelSelect.innerHTML = filtered.map(function(x) {",
             "        var c = providerColor(x.provider);",
-            "        var s = x.value === keepVal ? ' selected' : '';",
+            "        var s = x.value === selectedVal ? ' selected' : '';",
             "        return '<option value=\"'+x.value+'\" data-name=\"'+x.name+'\" data-url=\"'+x.url+'\" data-provider=\"'+(x.provider||'')+('\" style=\"color:'+c+'\"'+s+'>'+x.label+'</option>');",
             "    }).join('');",
             "    updateSelectColor();",
@@ -1553,18 +1555,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .header-controls { display: flex; gap: 6px; align-items: center; }
         .btn-cloud { background: none; border: 1px solid #00d2ff; color: #00d2ff; padding: 4px 10px; font-size: 11px; border-radius: 20px; cursor: pointer; font-weight: 700; transition: all 0.2s; }
         .btn-cloud:hover { background: rgba(0,210,255,0.15); }
-        /* ── Model combobox ── */
-        #modelComboWrap { display: flex; flex-direction: column; gap: 3px; align-items: stretch; min-width: 140px; max-width: 170px; }
-        #modelInputWrap { display: flex; align-items: center; background: rgba(10,10,26,0.95); border: 1px solid #333; border-radius: 8px; padding: 0 6px; gap: 4px; transition: border-color 0.2s; }
-        #modelInputWrap:focus-within { border-color: rgba(0,210,255,0.5); box-shadow: 0 0 0 2px rgba(0,210,255,0.08); }
-        #modelSearchIcon { color: #444; font-size: 14px; line-height: 1; flex-shrink: 0; pointer-events: none; }
-        #modelSearch { flex: 1; background: none; color: #e0e0e0; border: none; outline: none; font-size: 11px; font-family: 'Inter', sans-serif; padding: 5px 0; min-width: 0; }
-        #modelSearch::placeholder { color: #444; }
-        #modelClear { color: #444; font-size: 14px; cursor: pointer; line-height: 1; flex-shrink: 0; transition: color 0.15s; display: none; }
-        #modelClear:hover { color: #ff6b6b; }
-        #modelClear.visible { display: block; }
-        select#modelSelect { width: 100%; padding: 4px 6px; border-radius: 8px; background: #0a0a1a; border: 1px solid #2a2a3a; outline: none; font-size: 11px; color: #00d2ff; cursor: pointer; font-family: 'Inter', sans-serif; transition: border-color 0.2s; }
-        select#modelSelect:focus { border-color: rgba(0,210,255,0.4); }
+        select#modelSelect { max-width: 150px; padding: 4px 6px; border-radius: 20px; background: #0a0a1a; border: 1px solid #444; outline: none; font-size: 11px; color: #00d2ff; cursor: pointer; }
+        /* ── Model search ── */
+        #modelSearchWrap { display: flex; align-items: center; gap: 3px; }
+        #modelSearch { background: rgba(20,20,40,0.9); color: #e0e0e0; border: 1px solid #333; border-radius: 20px; padding: 3px 8px; font-size: 11px; outline: none; width: 0; max-width: 0; opacity: 0; transition: all 0.25s; font-family: 'Inter', sans-serif; }
+        #modelSearch.open { width: 90px; max-width: 90px; opacity: 1; border-color: rgba(0,210,255,0.4); }
+        #btnModelSearch { background: none; border: none; color: #555; cursor: pointer; font-size: 12px; padding: 0; transition: color 0.2s; line-height: 1; }
+        #btnModelSearch:hover { color: #00d2ff; }
         /* ── Provider-aware localWarn ── */
         #localWarn.gemini    { background: rgba(66,133,244,0.1);  color: #7ab4f5;  border-color: rgba(66,133,244,0.3); }
         #localWarn.openai    { background: rgba(116,170,156,0.1); color: #74aa9c;  border-color: rgba(116,170,156,0.3); }
@@ -1638,13 +1635,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <span class="header-brand">ANTIGRAVITY</span>
         <div class="header-controls">
             <button class="btn-cloud" id="btnCloud">☁️ Cloud</button>
-            <div id="modelComboWrap">
-                <div id="modelInputWrap">
-                    <span id="modelSearchIcon">⌕</span>
-                    <input id="modelSearch" type="text" placeholder="Modèle…" autocomplete="off" spellcheck="false">
-                    <span id="modelClear" title="Effacer">×</span>
-                </div>
-                <select id="modelSelect" size="1"></select>
+            <div id="modelSearchWrap">
+                <button id="btnModelSearch" title="Rechercher un modèle">🔍</button>
+                <input id="modelSearch" type="text" placeholder="Filtrer…" autocomplete="off" spellcheck="false">
+                <select id="modelSelect"></select>
             </div>
         </div>
     </div>
