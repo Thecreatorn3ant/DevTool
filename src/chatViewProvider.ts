@@ -303,6 +303,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'getTokenBudget':
                     this._sendTokenBudget();
                     break;
+                case 'patchNotification':
+                    vscode.window.showInformationMessage(`✅ ${data.summary}`);
+                    break;
                 case 'setTerminalPermission':
                     this._terminalPermission = data.value || 'ask-all';
                     this._context.workspaceState.update('terminalPermission', this._terminalPermission);
@@ -467,6 +470,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this._history.push({ role: 'ai', value: fullRes });
             this._updateHistory();
             this._view.webview.postMessage({ type: 'endResponse', value: fullRes });
+            this._sendTokenBudget();
 
             if (activeFile) {
                 const fileHist = this._fileCtxManager.getFileHistory(activeFile.name);
@@ -481,6 +485,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             const msg = e?.message ?? String(e);
             vscode.window.showErrorMessage(`Antigravity: ${msg}`);
             this._view.webview.postMessage({ type: 'endResponse', value: `**Erreur**: ${msg}` });
+            this._sendTokenBudget();
         }
     }
 
@@ -889,7 +894,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const usedChars = this._contextFiles.reduce((sum, f) => sum + f.content.length, 0);
         this._view.webview.postMessage({
             type: 'tokenBudget',
-            used: estimateTokens(usedChars.toString()),
+            used: Math.ceil(usedChars / 4),
             max: Math.floor(budget.max / 4),
             isCloud
         });
