@@ -6,7 +6,7 @@
     "publisher": "antigravity",
     "icon": "media/icon.png",
     "engines": {
-        "vscode": "1.109.5"
+        "vscode": "1.107.0"
     },
     "categories": [
         "AI",
@@ -89,12 +89,6 @@
             }
         },
         "menus": {
-            "scm/inputBox": [
-                {
-                    "command": "local-ai.generateCommitMessage",
-                    "when": "scmProvider == git"
-                }
-            ],
             "scm/title": [
                 {
                     "command": "local-ai.generateCommitMessage",
