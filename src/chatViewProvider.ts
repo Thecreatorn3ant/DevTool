@@ -252,6 +252,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         this._currentModel = data.model || 'llama3';
                         this._currentUrl = '';
                     }
+                    this._sendTokenBudget();
                     break;
                 case 'restoreHistory':
                     webviewView.webview.postMessage({ type: 'restoreHistory', history: this._history });
@@ -901,8 +902,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private _sendTokenBudget() {
         if (!this._view) return;
-        const isCloud = this._ollamaClient.isCloud(this._currentUrl || undefined);
-        const budget = this._ollamaClient.getTokenBudget(this._currentModel || 'llama3', this._currentUrl || undefined);
+        const url = this._currentUrl && this._currentUrl.trim() ? this._currentUrl : undefined;
+        const isCloud = url ? this._ollamaClient.isCloud(url) : false;
+        const budget = this._ollamaClient.getTokenBudget(this._currentModel || 'llama3', url);
         const usedChars = this._contextFiles.reduce((sum, f) => sum + f.content.length, 0);
         this._view.webview.postMessage({
             type: 'tokenBudget',
