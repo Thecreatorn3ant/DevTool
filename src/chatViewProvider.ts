@@ -1,4 +1,4 @@
-import * as vscode from 'vscode';
+﻿import * as vscode from 'vscode';
 import * as path from 'path';
 import * as os from 'os';
 import { OllamaClient } from './ollamaClient';
@@ -153,22 +153,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             const apiKeys = config.get<any[]>('apiKeys') || [];
             const now = Date.now();
             const items = apiKeys.map(k => ({
-                label: `${(k.rateLimitedUntil && k.rateLimitedUntil > now) ? '⏳' : '🟢'} ${k.label}`,
+                label: `${(k.rateLimitedUntil && k.rateLimitedUntil > now) ? 'â³' : 'ðŸŸ¢'} ${k.label}`,
                 description: k.platform, key: k.key
             }));
             const choice = await vscode.window.showQuickPick([
-                { label: '💻 Local', description: 'localhost:11434' },
-                { label: '➕ Ajouter Ollama Cloud' },
-                { label: '➕ Ajouter Together/OpenRouter' },
+                { label: 'ðŸ’» Local', description: 'localhost:11434' },
+                { label: 'âž• Ajouter Ollama Cloud' },
+                { label: 'âž• Ajouter Together/OpenRouter' },
                 ...items,
-                { label: '🗑️ Supprimer' }
+                { label: 'ðŸ—‘ï¸ Supprimer' }
             ]);
             if (!choice) return;
             if (choice.label.includes('Local')) {
                 await config.update('ollamaUrl', 'http://localhost:11434', true);
                 await config.update('apiKey', '', true);
             } else if (choice.label.includes('Ollama Cloud')) {
-                const key = await vscode.window.showInputBox({ prompt: "Clé ollama_...", password: true });
+                const key = await vscode.window.showInputBox({ prompt: "ClÃ© ollama_...", password: true });
                 if (key) {
                     const label = await vscode.window.showInputBox({ prompt: "Nom" }) || 'Cloud';
                     await config.update('apiKeys', [...apiKeys, { key, label, platform: 'ollama.com' }], true);
@@ -199,9 +199,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             let formattedModels = models.map(m => {
                 const uniqueValue = (m.isLocal ? 'local|' : 'cloud|') + m.name;
                 if (m.isLocal) {
-                    return { value: uniqueValue, name: m.name, url: m.url, label: `💻 ${m.name}`, isLocal: true };
+                    return { value: uniqueValue, name: m.name, url: m.url, label: `ðŸ’» ${m.name}`, isLocal: true };
                 } else {
-                    return { value: uniqueValue, name: m.name, url: m.url, label: `☁️ ${m.name}`, isLocal: false };
+                    return { value: uniqueValue, name: m.name, url: m.url, label: `â˜ï¸ ${m.name}`, isLocal: false };
                 }
             });
 
@@ -297,43 +297,83 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private _getHtmlForWebview(webview: vscode.Webview): string {
-        const logoUri = webview.asWebviewUri(vscode.Uri.joinPath(this._context.extensionUri, 'media', 'icon.png'));
         const bgUri = webview.asWebviewUri(vscode.Uri.joinPath(this._context.extensionUri, 'media', 'background.png'));
         return `<!DOCTYPE html><html><head><meta charset="UTF-8">
         <style>
-            body { font-family: 'Inter', sans-serif; background: #000; color: #fff; margin:0; height:100vh; display:flex; flex-direction:column; overflow:hidden; }
-            .space-bg { position:fixed; top:0; left:0; width:100%; height:100%; background: url('${bgUri}') no-repeat center center; background-size:cover; filter:brightness(0.4); z-index:-1; }
-            .header { padding:8px; background:rgba(0,0,0,0.8); display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #333; }
-            #chat { flex:1; overflow-y:auto; padding:15px; display:flex; flex-direction:column; gap:10px; }
-            .msg { padding:10px; border-radius:8px; border:1px solid #333; max-width:90%; line-height:1.5; }
-            .user { background:rgba(0,100,255,0.3); align-self:flex-end; }
-            .ai { background:rgba(30,30,40,0.9); align-self:flex-start; }
-            .input-area { padding:12px; background:#111; display:flex; gap:8px; border-top:1px solid #333; }
-            input { flex:1; background:#000; color:#fff; border:1px solid #444; padding:8px; border-radius:6px; outline:none; }
-            button { background:#007acc; color:#fff; border:none; padding:8px 15px; border-radius:6px; cursor:pointer; font-weight:bold; }
-            select { background:#111; color:#00d2ff; border:1px solid #333; font-size:11px; padding:3px; }
-            .code-block { background:#1e1e1e; border:1px solid #444; border-radius:6px; margin:10px 0; overflow:hidden; text-align:left; }
-            .code-header { background:#2d2d2d; padding:6px 10px; display:flex; justify-content:space-between; align-items:center; font-size:11px; color:#aaa; }
-            .code-header button { padding:4px 8px; font-size:11px; background:#007acc; border-radius:4px; margin-left:10px; }
-            .code-content { padding:10px; font-family:'Consolas', monospace; font-size:12px; color:#d4d4d4; white-space:pre-wrap; max-height:400px; overflow-y:auto; }
-            .code-block.patch { border-color:#007acc; }
-            .code-block.patch .code-header { background: rgba(0, 122, 204, 0.2); color:#fff; }
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&family=Fira+Code&display=swap');
+            * { box-sizing: border-box; }
+            body { font-family: 'Inter', sans-serif; background: #000; color: #e0e0e0; margin:0; height:100vh; display:flex; flex-direction:column; overflow:hidden; font-size:13px; }
+            .space-bg { position:fixed; top:0; left:0; width:100%; height:100%; background: url('${bgUri}') no-repeat center center; background-size:cover; filter:brightness(0.35); z-index:-1; }
+            /* Header */
+            .header { padding:8px 12px; background:rgba(5,5,15,0.92); display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(0,210,255,0.2); flex-shrink:0; }
+            .header-brand { font-weight:900; letter-spacing:2px; font-size:14px; color:#fff; text-shadow: 0 0 10px rgba(0,210,255,0.5); }
+            .header-controls { display:flex; gap:6px; align-items:center; }
+            .btn-cloud { background:none; border:1px solid #00d2ff; color:#00d2ff; padding:4px 10px; font-size:11px; border-radius:20px; cursor:pointer; font-weight:700; transition:all 0.2s; }
+            .btn-cloud:hover { background: rgba(0,210,255,0.15); }
+            select#modelSelect { max-width:150px; padding:4px 6px; border-radius:20px; background:#0a0a1a; border:1px solid #444; outline:none; font-size:11px; color:#00d2ff; cursor:pointer; }
+            /* Warn bar */
+            #localWarn { display:none; background:rgba(177,156,217,0.12); color:#c9a9f5; padding:6px 12px; font-size:11px; text-align:center; border-bottom:1px solid rgba(177,156,217,0.25); flex-shrink:0; }
+            /* Files context bar */
+            #filesBar { display:none; background:rgba(0,122,204,0.1); padding:5px 12px; font-size:11px; color:#aaa; border-bottom:1px solid rgba(0,122,204,0.2); display:flex; gap:6px; align-items:center; overflow-x:auto; white-space:nowrap; flex-shrink:0; }
+            #filesBar .file-tag { background:rgba(0,122,204,0.25); color:#6cb6ff; border:1px solid rgba(0,122,204,0.4); padding:2px 8px; border-radius:10px; cursor:pointer; font-size:11px; }
+            #filesBar .file-tag:hover { background:rgba(0,122,204,0.4); }
+            #filesBar .file-tag::after { content:"âœ•"; margin-left:6px; opacity:0.6; font-size:10px; }
+            /* Chat */
+            #chat { flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:12px; }
+            #chat::-webkit-scrollbar { width:4px; }
+            #chat::-webkit-scrollbar-thumb { background:#333; border-radius:2px; }
+            .msg { padding:10px 14px; border-radius:12px; max-width:95%; line-height:1.6; word-break:break-word; }
+            .user { background:rgba(0,80,200,0.35); align-self:flex-end; border:1px solid rgba(0,120,255,0.3); border-bottom-right-radius:2px; }
+            .ai { background:rgba(15,15,30,0.9); align-self:flex-start; width:100%; border:1px solid rgba(255,255,255,0.07); border-bottom-left-radius:2px; }
+            .ai b { color:#fff; }
+            .ai code { background:#1a1a2e; color:#00d2ff; padding:2px 5px; border-radius:4px; font-family:'Fira Code', monospace; font-size:11px; }
+            /* Code blocks */
+            .code-block { background:#0d0d1a; border:1px solid #2a2a3a; border-radius:8px; margin:10px 0; overflow:hidden; }
+            .code-header { background:#141424; padding:8px 12px; display:flex; justify-content:space-between; align-items:center; font-size:11px; color:#888; border-bottom:1px solid #2a2a3a; }
+            .code-header button { padding:4px 10px; font-size:11px; background:#007acc; border-radius:12px; margin-left:8px; cursor:pointer; border:none; color:#fff; font-weight:700; transition:background 0.2s; }
+            .code-header button:hover { background:#0090e0; }
+            .code-content { padding:12px; font-family:'Fira Code', monospace; font-size:12px; color:#cdd; white-space:pre-wrap; overflow-x:auto; max-height:400px; overflow-y:auto; }
+            .code-block.patch { border-color:rgba(0,122,204,0.5); }
+            .code-block.patch .code-header { background:rgba(0,60,120,0.4); color:#6cb6ff; border-color:rgba(0,122,204,0.3); }
+            .code-block.patch .code-content .search-marker { color:#f97583; }
+            .code-block.patch .code-content .replace-marker { color:#85e89d; }
+            /* Input area */
+            .input-area { padding:10px 12px; background:rgba(5,5,15,0.92); display:flex; flex-direction:column; gap:8px; border-top:1px solid rgba(0,210,255,0.15); flex-shrink:0; }
+            .input-row { display:flex; gap:8px; align-items:flex-end; }
+            #prompt { flex:1; background:rgba(20,20,40,0.8); color:#e0e0e0; border:1px solid #333; padding:10px 14px; border-radius:22px; outline:none; font-family:'Inter',sans-serif; font-size:13px; resize:none; min-height:40px; max-height:120px; line-height:1.4; transition:border-color 0.2s; }
+            #prompt:focus { border-color: rgba(0,210,255,0.5); }
+            #send { background:#007acc; color:#fff; border:none; padding:10px 18px; border-radius:22px; cursor:pointer; font-weight:700; font-size:13px; white-space:nowrap; transition:background 0.2s; }
+            #send:hover { background:#0090e0; }
+            .input-actions { display:flex; gap:6px; }
+            .btn-action { background:rgba(255,255,255,0.06); color:#aaa; border:1px solid #333; padding:4px 10px; border-radius:12px; cursor:pointer; font-size:11px; transition:all 0.2s; }
+            .btn-action:hover { background:rgba(255,255,255,0.12); color:#fff; }
+            .thinking { display:flex; gap:4px; align-items:center; padding:6px 0; }
+            .thinking span { width:6px; height:6px; background:#00d2ff; border-radius:50%; animation:bounce 1.2s infinite; }
+            .thinking span:nth-child(2) { animation-delay:0.2s; }
+            .thinking span:nth-child(3) { animation-delay:0.4s; }
+            @keyframes bounce { 0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-8px)} }
+            button { font-family:'Inter',sans-serif; }
         </style></head>
         <body><div class="space-bg"></div>
             <div class="header">
-                <span style="font-weight:900; letter-spacing:1px;">ANTIGRAVITY</span>
-                <div style="display:flex; gap:6px; align-items:center;">
-                    <button id="btnCloud" style="background:none; border:1px solid #00d2ff; color:#00d2ff; padding:4px 8px; font-size:11px; border-radius:4px; cursor:pointer;">☁️ Cloud</button> 
-                    <select id="modelSelect" style="max-width:140px; padding:3px; border-radius:4px; background:#111; border:1px solid #333; outline:none; text-overflow:ellipsis; white-space:nowrap; overflow:hidden;"></select>
+                <span class="header-brand">ANTIGRAVITY</span>
+                <div class="header-controls">
+                    <button class="btn-cloud" id="btnCloud">â˜ï¸ Cloud</button>
+                    <select id="modelSelect"></select>
                 </div>
             </div>
-            <div id="localWarn" style="display:none; background:rgba(177,156,217,0.15); color:#b19cd9; padding:6px; font-size:11px; text-align:center; border-bottom:1px solid rgba(177,156,217,0.3);">
-                ⚠️ <b>Mode Local</b> : Déconseillé pour les gros fichiers (risques d'erreurs).
-            </div>
+            <div id="localWarn">âš ï¸ <b>Mode Local</b> â€” DÃ©conseillÃ© pour les gros fichiers</div>
+            <div id="filesBar"></div>
             <div id="chat"></div>
             <div class="input-area">
-                <input id="prompt" placeholder="Posez une question...">
-                <button id="send">SEND</button>
+                <div class="input-actions">
+                    <button class="btn-action" id="btnAddFile">ðŸ“Ž Contexte fichier</button>
+                    <button class="btn-action" id="btnClearHistory">ðŸ—‘ï¸ Effacer</button>
+                </div>
+                <div class="input-row">
+                    <textarea id="prompt" placeholder="Posez une question... (EntrÃ©e pour envoyer)" rows="1"></textarea>
+                    <button id="send">SEND</button>
+                </div>
             </div>
             <script>
                 const vscode = acquireVsCodeApi();
@@ -341,115 +381,202 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 const prompt = document.getElementById('prompt');
                 const send = document.getElementById('send');
                 const modelSelect = document.getElementById('modelSelect');
+                const filesBar = document.getElementById('filesBar');
+                let contextFiles = []; // [{name, content}]
 
-                const add = (txt, cls, isHtml = false) => { 
-                    const d = document.createElement('div'); 
-                    d.className = 'msg ' + cls; 
-                    if(isHtml) d.innerHTML = txt; else d.innerText = txt; 
-                    chat.appendChild(d); 
-                    chat.scrollTop = chat.scrollHeight; 
-                    return d; 
+                // Auto-resize textarea
+                prompt.addEventListener('input', () => {
+                    prompt.style.height = 'auto';
+                    prompt.style.height = Math.min(prompt.scrollHeight, 120) + 'px';
+                });
+
+                const addContextFile = (name, content) => {
+                    if(contextFiles.find(f => f.name === name)) return;
+                    contextFiles.push({name, content});
+                    renderFilesBar();
+                };
+                const renderFilesBar = () => {
+                    if(contextFiles.length === 0) { filesBar.style.display = 'none'; return; }
+                    filesBar.style.display = 'flex';
+                    filesBar.innerHTML = '<span style="color:#666;margin-right:4px;">Contexte :</span>' + 
+                        contextFiles.map((f,i) => '<span class="file-tag" data-idx="'+i+'">'+f.name+'</span>').join('');
+                    filesBar.querySelectorAll('.file-tag').forEach(el => {
+                        el.onclick = () => {
+                            const idx = parseInt(el.getAttribute('data-idx'));
+                            contextFiles.splice(idx, 1);
+                            renderFilesBar();
+                        };
+                    });
                 };
 
+                const add = (txt, cls, isHtml = false) => {
+                    const d = document.createElement('div');
+                    d.className = 'msg ' + cls;
+                    if(isHtml) d.innerHTML = txt; else d.innerText = txt;
+                    chat.appendChild(d);
+                    chat.scrollTop = chat.scrollHeight;
+                    return d;
+                };
+
+                const applyPatch = (encodedPatch) => {
+                    try {
+                        const raw = decodeURIComponent(encodedPatch);
+                        vscode.postMessage({type: 'applyToActiveFile', value: raw});
+                    } catch(e) { console.error('Patch error', e); }
+                };
+                window.applyPatch = applyPatch;
+
                 const renderMarkdown = (text) => {
-                    let t = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
                     const blocks = [];
-                    // Replace code blocks
-                    t = t.replace(/\`\`\`(.*?)\\n([\\s\\S]*?)\`\`\`/g, (match, lang, inner) => {
-                        const raw = inner.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-                        const isPatch = raw.includes('SEARCH') || raw.includes('=======');
-                        const encMatch = encodeURIComponent(match.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'));
+                    // Handle code blocks BEFORE HTML escaping (process raw text)
+                    const processed = text.replace(/\`\`\`(\\w*)?\\n?([\\s\\S]*?)\`\`\`/g, (match, lang, inner) => {
+                        lang = (lang || '').trim();
+                        const isPatch = inner.includes('<<<<<<') || inner.includes('SEARCH');
+                        let displayInner = inner
+                            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
                         
-                        let blockHtml = '';
+                        let blockHtml;
                         if (isPatch) {
-                            blockHtml = '<div class="code-block patch">' +
-                                '<div class="code-header"><span>🛠️ Proposition de modification</span><button onclick="vscode.postMessage({type:\\'applyToActiveFile\\', value: decodeURIComponent(\\''+encMatch+'\\')})">Appliquer direct ✅</button></div>' +
-                                '<div class="code-content">' + inner + '</div></div>';
+                            const encoded = encodeURIComponent(match);
+                            blockHtml = \`<div class="code-block patch">
+                                <div class="code-header">
+                                    <span>ðŸ› ï¸ Proposition de modification</span>
+                                    <button onclick="applyPatch('\${encoded.replace(/'/g, "\\\\'")}')">Appliquer direct âœ…</button>
+                                </div>
+                                <div class="code-content">\${displayInner}</div>
+                            </div>\`;
                         } else {
-                            const rawEnc = encodeURIComponent(raw);
-                            blockHtml = '<div class="code-block">' +
-                                '<div class="code-header"><span>📄 Code ' + lang + '</span><button onclick="vscode.postMessage({type:\\'createFile\\', value: decodeURIComponent(\\''+rawEnc+'\\'), target: \\'nouveau.ts\\'})">Créer fichier</button></div>' +
-                                '<div class="code-content">' + inner + '</div></div>';
+                            const encoded = encodeURIComponent(inner);
+                            blockHtml = \`<div class="code-block">
+                                <div class="code-header">
+                                    <span>ðŸ“„ \${lang || 'Code'}</span>
+                                    <button onclick="vscode.postMessage({type:'createFile',value:decodeURIComponent('\${encoded.replace(/'/g, "\\\\'")}'),target:'nouveau.\${lang||'txt'}' })">CrÃ©er fichier</button>
+                                </div>
+                                <div class="code-content">\${displayInner}</div>
+                            </div>\`;
                         }
                         blocks.push(blockHtml);
-                        return '%%%BLOCK_'+(blocks.length-1)+'%%%';
+                        return '%%%BLOCK_' + (blocks.length - 1) + '%%%';
                     });
 
-                    // Format text
+                    // Escape remaining HTML
+                    let t = processed.replace(/&(?!amp;|lt;|gt;|quot;|#)/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    
+                    // Format Markdown text
                     t = t.replace(/\\*\\*(.*?)\\*\\*/g, '<b>$1</b>');
                     t = t.replace(/\\*(.*?)\\*/g, '<i>$1</i>');
-                    t = t.replace(/\`([^\`]+)\`/g, '<code style="background:#333;color:#00d2ff;padding:2px 4px;border-radius:3px;font-family:monospace;">$1</code>');
-                    t = t.replace(/\\n/g, '<br/>');
+                    t = t.replace(/\`([^\`\\n]+)\`/g, '<code>$1</code>');
+                    t = t.replace(/\\n/g, '<br>');
 
-                    // Inject blocks back
-                    t = t.replace(/%%%BLOCK_(\\d+)%%%/g, (match, idx) => blocks[parseInt(idx)] || '');
+                    // Restore code blocks
+                    t = t.replace(/%%%BLOCK_(\\d+)%%%/g, (_, idx) => blocks[parseInt(idx)] || '');
                     return t;
                 };
 
                 let currentAiMsg = null;
                 let currentAiText = '';
 
-                send.onclick = () => { 
-                    const v = prompt.value; 
-                    if(!v) return; 
-                    add(v, 'user'); 
-                    
+                const doSend = () => {
+                    const v = prompt.value.trim();
+                    if(!v) return;
+                    add(v, 'user');
+
                     const opt = modelSelect.options[modelSelect.selectedIndex];
                     const url = opt ? opt.getAttribute('data-url') : '';
                     const actualModel = opt ? opt.getAttribute('data-name') : '';
-                    
-                    vscode.postMessage({ type: 'sendMessage', value: v, model: actualModel, url }); 
-                    prompt.value=''; 
+
+                    // Build extra context from added files
+                    let extraCtx = '';
+                    if(contextFiles.length > 0) {
+                        extraCtx = contextFiles.map(f => \`\\n[FICHIER: \${f.name}]\\n\${f.content.substring(0, 8000)}\`).join('\\n');
+                    }
+
+                    vscode.postMessage({ type: 'sendMessage', value: v + extraCtx, model: actualModel, url });
+                    prompt.value = '';
+                    prompt.style.height = 'auto';
                 };
-                prompt.onkeydown = e => { if(e.key === 'Enter') send.onclick(); };
+
+                send.onclick = doSend;
+                prompt.onkeydown = e => {
+                    if(e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); }
+                };
+
                 document.getElementById('btnCloud').onclick = () => vscode.postMessage({ type: 'openCloudConnect' });
+                document.getElementById('btnClearHistory').onclick = () => {
+                    chat.innerHTML = '';
+                    vscode.postMessage({ type: 'clearHistory' });
+                };
+                document.getElementById('btnAddFile').onclick = () => vscode.postMessage({ type: 'requestFileAccess', target: '__dialog__' });
 
                 window.addEventListener('message', e => {
                     const m = e.data;
+
                     if(m.type === 'setModels') {
                         modelSelect.innerHTML = m.models.map(x => {
-                            const color = x.isLocal ? '#b19cd9' : '#00d2ff'; // Purple for local, Blue for cloud
-                            const isSelected = x.value === m.selected ? 'selected' : '';
-                            return '<option value="'+x.value+'" data-name="'+x.name+'" data-url="'+x.url+'" style="color: '+color+';" '+isSelected+'>'+x.label+'</option>';
+                            const color = x.isLocal ? '#b19cd9' : '#00d2ff';
+                            const sel = x.value === m.selected ? 'selected' : '';
+                            return \`<option value="\${x.value}" data-name="\${x.name}" data-url="\${x.url}" style="color:\${color}" \${sel}>\${x.label}</option>\`;
                         }).join('');
-                        
-                        const updateSelectColor = () => {
-                            const selectedOption = modelSelect.options[modelSelect.selectedIndex];
-                            if (selectedOption) {
-                                modelSelect.style.color = selectedOption.style.color;
-                                modelSelect.style.borderColor = selectedOption.style.color;
-                                const url = selectedOption.getAttribute('data-url');
-                                const isLocal = url && (url.includes('localhost') || url.includes('127.0.0.1'));
-                                document.getElementById('localWarn').style.display = isLocal ? 'block' : 'none';
-                            }
-                        };
-                        modelSelect.onchange = () => {
-                            updateSelectColor();
-                            vscode.postMessage({ type: 'saveModel', model: modelSelect.value });
-                        };
                         updateSelectColor();
                     }
+
                     if(m.type === 'startResponse') {
-                        currentAiMsg = add('', 'ai', true);
+                        currentAiMsg = document.createElement('div');
+                        currentAiMsg.className = 'msg ai';
+                        currentAiMsg.innerHTML = '<div class="thinking"><span></span><span></span><span></span></div>';
+                        chat.appendChild(currentAiMsg);
+                        chat.scrollTop = chat.scrollHeight;
                         currentAiText = '';
                     }
+
                     if(m.type === 'partialResponse') {
-                        if(!currentAiMsg) currentAiMsg = add('', 'ai', true);
+                        if(!currentAiMsg) { currentAiMsg = add('', 'ai', true); }
                         currentAiText += m.value;
                         currentAiMsg.innerHTML = renderMarkdown(currentAiText);
                         chat.scrollTop = chat.scrollHeight;
                     }
+
                     if(m.type === 'endResponse') {
+                        const finalText = m.value || currentAiText;
                         if(currentAiMsg) {
-                            currentAiMsg.innerHTML = renderMarkdown(m.value);
-                            currentAiMsg = null;
+                            currentAiMsg.innerHTML = renderMarkdown(finalText);
                         } else {
-                            add(renderMarkdown(m.value), 'ai', true);
+                            add(renderMarkdown(finalText), 'ai', true);
                         }
+                        currentAiMsg = null;
                         currentAiText = '';
                     }
+
+                    if(m.type === 'fileContent') {
+                        addContextFile(m.name, m.content);
+                    }
+
                     if(m.type === 'injectMessage') { prompt.value = m.value; prompt.focus(); }
+
+                    if(m.type === 'restoreHistory') {
+                        if(m.history && m.history.length > 0) {
+                            m.history.forEach(msg => {
+                                add(msg.role === 'ai' ? renderMarkdown(msg.value) : msg.value, msg.role, msg.role === 'ai');
+                            });
+                        }
+                    }
                 });
+
+                const updateSelectColor = () => {
+                    const opt = modelSelect.options[modelSelect.selectedIndex];
+                    if(opt) {
+                        modelSelect.style.color = opt.style.color;
+                        modelSelect.style.borderColor = opt.style.color;
+                        const url = opt.getAttribute('data-url');
+                        const isLocal = url && (url.includes('localhost') || url.includes('127.0.0.1'));
+                        document.getElementById('localWarn').style.display = isLocal ? 'block' : 'none';
+                    }
+                };
+                modelSelect.onchange = () => {
+                    updateSelectColor();
+                    vscode.postMessage({ type: 'saveModel', model: modelSelect.value });
+                };
+
                 vscode.postMessage({ type: 'getModels' });
                 vscode.postMessage({ type: 'restoreHistory' });
             </script>
