@@ -257,31 +257,46 @@ export class OllamaClient {
     ): Promise<string> {
         const { key: apiKey, entry: keyEntry } = this._getAvailableKey(url);
         const isOpenAI = this._isOpenAI(url);
+        const isGemini = this._isGemini(url);
         const systemPrompt = this._getSystemPrompt();
 
         try {
             const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-            if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+            if (apiKey && !isGemini) headers['Authorization'] = `Bearer ${apiKey}`;
+
             if (url.includes('openrouter')) {
                 headers['HTTP-Referer'] = 'https://github.com/microsoft/vscode';
                 headers['X-Title'] = 'VSCode Antigravity';
             }
 
-            const endpoint = isOpenAI ? `${url}/chat/completions` : `${url}/api/generate`;
+            let endpoint = isOpenAI ? `${url}/chat/completions` : `${url}/api/generate`;
+            let reqBody: any;
 
-            const reqBody = isOpenAI ? {
-                model,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: fullPrompt }
-                ],
-                stream: true
-            } : {
-                model,
-                prompt: fullPrompt,
-                system: systemPrompt,
-                stream: true
-            };
+            if (isGemini) {
+                endpoint = `${url}/models/${model}:streamGenerateContent?key=${apiKey}`;
+                reqBody = {
+                    contents: [{
+                        role: 'user',
+                        parts: [{ text: systemPrompt + "\n\n" + fullPrompt }]
+                    }]
+                };
+            } else if (isOpenAI) {
+                reqBody = {
+                    model,
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: fullPrompt }
+                    ],
+                    stream: true
+                };
+            } else {
+                reqBody = {
+                    model,
+                    prompt: fullPrompt,
+                    system: systemPrompt,
+                    stream: true
+                };
+            }
 
             const response = await fetch(endpoint, {
                 method: 'POST',
@@ -324,10 +339,18 @@ export class OllamaClient {
                 buffer = lines.pop() ?? '';
 
                 for (const line of lines) {
-                    const cleanLine = line.trim();
+                    let cleanLine = line.trim();
                     if (!cleanLine) continue;
 
-                    if (isOpenAI) {
+                    if (isGemini) {
+                        if (cleanLine.startsWith(',')) cleanLine = cleanLine.slice(1).trim();
+                        if (cleanLine.startsWith('[') || cleanLine.startsWith(']')) continue;
+                        try {
+                            const data = JSON.parse(cleanLine);
+                            const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                            if (content) { fullResponse += content; onUpdate(content); }
+                        } catch { }
+                    } else if (isOpenAI) {
                         if (cleanLine === 'data: [DONE]') continue;
                         if (cleanLine.startsWith('data: ')) {
                             try {
@@ -418,6 +441,35 @@ Règles :
         return url.includes('together') || url.includes('openrouter') || url.endsWith('/v1');
     }
 
+    _detectProvider(url: string): string {
+        const u = (url || '').toLowerCase();
+        if (!u || u.includes('localhost') || u.includes('127.0.0.1')) return 'local';
+        if (u.includes('generativelanguage.googleapis.com')) return 'gemini';
+        if (u.includes('openai.com')) return 'openai';
+        if (u.includes('openrouter')) return 'openrouter';
+        if (u.includes('together')) return 'together';
+        if (u.includes('mistral')) return 'mistral';
+        if (u.includes('groq')) return 'groq';
+        if (u.includes('anthropic') || u.includes('claude')) return 'anthropic';
+        return 'ollama-cloud';
+    }
+
+    private _isGemini(url: string): boolean {
+        return url.includes('generativelanguage.googleapis.com');
+    }
+
+    private async _listGeminiModels(apiKey: string): Promise<string[]> {
+        try {
+            const endpoint = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+            const res = await fetch(endpoint, { signal: AbortSignal.timeout(5000) });
+            if (!res.ok) return [];
+            const data: any = await res.json();
+            return (data?.models || [])
+                .map((m: any) => (m.name as string).replace('models/', ''))
+                .filter((n: string) => n.includes('gemini'));
+        } catch { return []; }
+    }
+
     async listModels(): Promise<string[]> {
         const url = this._getBaseUrl();
         const { key: apiKey } = this._getAvailableKey(url);
@@ -436,8 +488,8 @@ Règles :
         } catch { return []; }
     }
 
-    async listAllModels(): Promise<{ name: string; isLocal: boolean; url: string }[]> {
-        const result: { name: string; isLocal: boolean; url: string }[] = [];
+    async listAllModels(): Promise<{ name: string; isLocal: boolean; url: string; provider: string }[]> {
+        const result: { name: string; isLocal: boolean; url: string; provider: string }[] = [];
         const seen = new Set<string>();
 
         const LOCAL_URL = 'http://localhost:11434';
@@ -447,7 +499,7 @@ Règles :
                 const data: any = await res.json();
                 for (const m of (data?.models || []).map((x: any) => x.name).filter(Boolean)) {
                     const key = `${LOCAL_URL}||${m}`;
-                    if (!seen.has(key)) { seen.add(key); result.push({ name: m, isLocal: true, url: LOCAL_URL }); }
+                    if (!seen.has(key)) { seen.add(key); result.push({ name: m, isLocal: true, url: LOCAL_URL, provider: 'local' }); }
                 }
             }
         } catch { }
@@ -468,7 +520,7 @@ Règles :
                         : (data?.models || []).map((m: any) => (m.name ?? m.id) as string).filter(Boolean);
                     for (const m of list) {
                         const k = `${configuredUrl}||${m}`;
-                        if (!seen.has(k)) { seen.add(k); result.push({ name: m, isLocal: false, url: configuredUrl }); }
+                        if (!seen.has(k)) { seen.add(k); result.push({ name: m, isLocal: false, url: configuredUrl, provider: this._detectProvider(configuredUrl) }); }
                     }
                 }
             } catch { }
@@ -479,22 +531,28 @@ Règles :
             const baseUrl = entry.url.replace(/\/+$/, '');
             const alreadyDoneAsLocal = (baseUrl === LOCAL_URL || baseUrl === 'http://127.0.0.1:11434') && !entry.key;
             if (alreadyDoneAsLocal) continue;
+            const provider = this._detectProvider(baseUrl);
             try {
-                const isOpenAI = this._isOpenAI(baseUrl);
-                const endpoint = isOpenAI ? `${baseUrl}/models` : `${baseUrl}/api/tags`;
-                const fetchHeaders: Record<string, string> = {};
-                if (entry.key) fetchHeaders['Authorization'] = `Bearer ${entry.key}`;
-                const res = await fetch(endpoint, { headers: fetchHeaders, signal: AbortSignal.timeout(4000) });
-                if (res.ok) {
-                    const data: any = await res.json();
-                    const list: string[] = isOpenAI
-                        ? (data?.data || []).map((m: any) => m.id as string).filter(Boolean)
-                        : (data?.models || []).map((m: any) => (m.name ?? m.id) as string).filter(Boolean);
-                    for (const m of list) {
-                        const k = `${baseUrl}||${m}`;
-                        const isLocal = !entry.key && (baseUrl === LOCAL_URL || baseUrl === 'http://127.0.0.1:11434');
-                        if (!seen.has(k)) { seen.add(k); result.push({ name: m, isLocal, url: baseUrl }); }
+                let list: string[] = [];
+                if (provider === 'gemini' && entry.key) {
+                    list = await this._listGeminiModels(entry.key);
+                } else {
+                    const isOpenAI = this._isOpenAI(baseUrl);
+                    const endpoint = isOpenAI ? `${baseUrl}/models` : `${baseUrl}/api/tags`;
+                    const fetchHeaders: Record<string, string> = {};
+                    if (entry.key) fetchHeaders['Authorization'] = `Bearer ${entry.key}`;
+                    const res = await fetch(endpoint, { headers: fetchHeaders, signal: AbortSignal.timeout(4000) });
+                    if (res.ok) {
+                        const data: any = await res.json();
+                        list = isOpenAI
+                            ? (data?.data || []).map((m: any) => m.id as string).filter(Boolean)
+                            : (data?.models || []).map((m: any) => (m.name ?? m.id) as string).filter(Boolean);
                     }
+                }
+                for (const m of list) {
+                    const k = `${baseUrl}||${m}`;
+                    const isLocal = !entry.key && (baseUrl === LOCAL_URL || baseUrl === 'http://127.0.0.1:11434');
+                    if (!seen.has(k)) { seen.add(k); result.push({ name: m, isLocal, url: baseUrl, provider: isLocal ? 'local' : provider }); }
                 }
             } catch { }
         }
