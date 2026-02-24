@@ -1,7 +1,8 @@
 ﻿import * as vscode from 'vscode';
 import * as path from 'path';
 import * as os from 'os';
-import { OllamaClient } from './ollamaClient';
+import { OllamaClient, ContextFile, ApiKeyStatus, estimateTokens } from './ollamaClient';
+import { FileContextManager } from './fileContextManager';
 
 interface ChatMessage {
     role: 'user' | 'ai';
@@ -18,19 +19,13 @@ class AiPreviewProvider implements vscode.TextDocumentContentProvider {
         this._content.set(uri.toString(), text);
         this._emitter.fire(uri);
     }
-    delete(uri: vscode.Uri) {
-        this._content.delete(uri.toString());
-    }
+    delete(uri: vscode.Uri) { this._content.delete(uri.toString()); }
     provideTextDocumentContent(uri: vscode.Uri): string {
         const uriStr = uri.toString();
-        if (this._content.has(uriStr)) {
-            return this._content.get(uriStr)!;
-        }
+        if (this._content.has(uriStr)) return this._content.get(uriStr)!;
         const lowerUri = uriStr.toLowerCase();
         for (const [key, value] of this._content.entries()) {
-            if (key.toLowerCase() === lowerUri) {
-                return value;
-            }
+            if (key.toLowerCase() === lowerUri) return value;
         }
         return '';
     }
@@ -42,7 +37,6 @@ function applySearchReplace(
 ): { result: string; patchCount: number; errors: string[] } {
     const errors: string[] = [];
     let patchCount = 0;
-
     const norm = (s: string) => s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     const isCrLf = documentText.includes('\r\n');
     const docNorm = norm(documentText);
@@ -68,28 +62,22 @@ function applySearchReplace(
             if (isCloseMarker(line)) {
                 patches.push({ search: searchLines.join('\n'), replace: replaceLines.join('\n') });
                 state = 'idle';
-            } else {
-                replaceLines.push(line);
-            }
+            } else { replaceLines.push(line); }
         }
     }
     if (state === 'replace' && searchLines.length > 0) {
         patches.push({ search: searchLines.join('\n'), replace: replaceLines.join('\n') });
     }
 
-    if (patches.length === 0) {
-        return { result: documentText, patchCount: 0, errors: [] };
-    }
+    if (patches.length === 0) return { result: documentText, patchCount: 0, errors: [] };
 
     let workingText = docNorm;
 
     for (const patch of patches) {
         const { search, replace } = patch;
-
         if (workingText.includes(search)) {
             workingText = workingText.replace(search, replace);
-            patchCount++;
-            continue;
+            patchCount++; continue;
         }
 
         const trimEnd = (s: string) => s.split('\n').map(l => l.trimEnd()).join('\n');
@@ -98,8 +86,7 @@ function applySearchReplace(
         if (workingTrimmed.includes(searchTrimmed)) {
             const tempDoc = workingText.split('\n').map(l => l.trimEnd()).join('\n');
             workingText = tempDoc.replace(searchTrimmed, replace);
-            patchCount++;
-            continue;
+            patchCount++; continue;
         }
 
         const fuzzyLines = search.split('\n').map(l => l.trim()).filter(l => l.length > 0);
@@ -112,46 +99,111 @@ function applySearchReplace(
                 while (si < fuzzyLines.length && di < workingLines.length) {
                     const dl = workingLines[di].trim();
                     if (dl === '') { di++; continue; }
-                    if (dl !== fuzzyLines[si]) { break; }
+                    if (dl !== fuzzyLines[si]) break;
                     si++; di++;
                 }
                 if (si === fuzzyLines.length) {
                     const textToReplace = workingLines.slice(i, di).join('\n');
-                    const count = workingText.split(textToReplace).length - 1;
-                    if (count === 1) {
+                    if (workingText.split(textToReplace).length - 1 === 1) {
                         workingText = workingText.replace(textToReplace, replace);
-                        patchCount++;
-                        fuzzyMatched = true;
+                        patchCount++; fuzzyMatched = true;
                     }
                     break;
                 }
             }
         }
-
-        if (!fuzzyMatched) {
-            errors.push(`Bloc SEARCH introuvable : "${search.substring(0, 60)}..."`);
-        }
+        if (!fuzzyMatched) errors.push(`Bloc SEARCH introuvable : "${search.substring(0, 60)}..."`);
     }
 
     let result = workingText;
-    if (isCrLf) {
-        result = result.replace(/\n/g, '\r\n');
-    }
+    if (isCrLf) result = result.replace(/\n/g, '\r\n');
     return { result, patchCount, errors };
+}
+
+function parseAiResponse(response: string): {
+    needFiles: string[];
+    willModify: string[];
+    plan: string | null;
+    createFiles: Array<{ name: string; content: string }>;
+    projectSummary: string | null;
+    commands: Array<{ cmd: string; isImportant: boolean; badge: string; label: string }>;
+} {
+    const needFiles: string[] = [];
+    const willModify: string[] = [];
+    const createFiles: Array<{ name: string; content: string }> = [];
+    let plan: string | null = null;
+    let projectSummary: string | null = null;
+
+    const needFileRegex = /\[NEED_FILE:\s*([^\]]+)\]/g;
+    let m;
+    while ((m = needFileRegex.exec(response)) !== null) {
+        needFiles.push(m[1].trim());
+    }
+
+    const willModifyMatch = /\[WILL_MODIFY:\s*([^\]]+)\]/.exec(response);
+    if (willModifyMatch) {
+        willModify.push(...willModifyMatch[1].split(',').map(s => s.trim()).filter(Boolean));
+    }
+
+    const planMatch = /\[PLAN\]([\s\S]*?)\[\/PLAN\]/.exec(response);
+    if (planMatch) plan = planMatch[1].trim();
+
+    const createFileRegex = /\[CREATE_FILE:\s*([^\]]+)\]\s*```(?:\w+)?\n([\s\S]*?)```/g;
+    while ((m = createFileRegex.exec(response)) !== null) {
+        createFiles.push({ name: m[1].trim(), content: m[2] });
+    }
+
+    const summaryMatch = /\[PROJECT_SUMMARY\]([\s\S]*?)\[\/PROJECT_SUMMARY\]/.exec(response);
+    if (summaryMatch) projectSummary = summaryMatch[1].trim();
+
+    const commands: Array<{ cmd: string; isImportant: boolean; badge: string; label: string }> = [];
+    const cmdRegex = /\[CMD(?:_(IMPORTANT))?:\s*([^\]]+)\]/g;
+    while ((m = cmdRegex.exec(response)) !== null) {
+        const isImportant = !!m[1];
+        commands.push({
+            isImportant,
+            cmd: m[2].trim(),
+            badge: isImportant ? 'important' : 'normal',
+            label: isImportant ? 'CRITIQUE' : 'CMD'
+        });
+    }
+
+    return { needFiles, willModify, plan, createFiles, projectSummary, commands };
+}
+
+function extractMultiFilePatches(response: string): Map<string, string> {
+    const patches = new Map<string, string>();
+
+    const fileBlockRegex = /\[FILE:\s*([^\]]+)\]([\s\S]*?)(?=\[FILE:|$)/g;
+    let m;
+    while ((m = fileBlockRegex.exec(response)) !== null) {
+        const fileName = m[1].trim();
+        const content = m[2].trim();
+        if (content) patches.set(fileName, content);
+    }
+
+    return patches;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'local-ai.chatView';
     private _view?: vscode.WebviewView;
     private _history: ChatMessage[] = [];
+    private _contextFiles: ContextFile[] = [];
+    private _thinkMode: boolean = false;
+    private _currentModel: string = 'llama3';
+    private _currentUrl: string = '';
+    private _terminalPermission: 'ask-all' | 'ask-important' | 'allow-all' = 'ask-all';
     private static readonly _previewProvider = new AiPreviewProvider();
     private static _providerRegistered = false;
 
     constructor(
         private readonly _context: vscode.ExtensionContext,
         private readonly _ollamaClient: OllamaClient,
+        private readonly _fileCtxManager: FileContextManager,
     ) {
         this._history = this._context.workspaceState.get<ChatMessage[]>('chatHistory', []);
+        this._terminalPermission = this._context.workspaceState.get<'ask-all' | 'ask-important' | 'allow-all'>('terminalPermission', 'ask-all');
         if (!ChatViewProvider._providerRegistered) {
             this._context.subscriptions.push(
                 vscode.workspace.registerTextDocumentContentProvider(
@@ -161,6 +213,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             );
             ChatViewProvider._providerRegistered = true;
         }
+
+        vscode.window.onDidChangeActiveTextEditor((editor) => {
+            if (editor && this._view) {
+                const name = vscode.workspace.asRelativePath(editor.document.fileName);
+                const history = this._fileCtxManager.getFileHistory(name);
+                this._view.webview.postMessage({ type: 'fileHistoryChanged', fileName: name, history });
+            }
+        });
     }
 
     public resolveWebviewView(
@@ -177,17 +237,82 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {
-                case 'sendMessage': await this._handleSendMessage(data.value, data.model, data.url); break;
+                case 'sendMessage':
+                    await this._handleSendMessage(data.value, data.model, data.url, data.contextFiles, data.thinkMode);
+                    break;
                 case 'openCloudConnect': await this._handleCloudConnection(); break;
                 case 'getModels': await this._updateModelsList(); break;
-                case 'saveModel': await this._context.workspaceState.update('lastSelectedModel', data.model); break;
-                case 'restoreHistory': webviewView.webview.postMessage({ type: 'restoreHistory', history: this._history }); break;
-                case 'createFile': if (data.value && data.target) { await this._handleFileCreation(data.target, data.value); } break;
-                case 'applyToActiveFile': if (data.value) { await this._handleApplyEdit(data.value, data.targetFile); } break;
-                case 'requestFileAccess': if (data.target) { await this._handleFileAccessRequest(data.target); } break;
-                case 'clearHistory': this._history = []; this._updateHistory(); break;
-                case 'openFile': if (data.value) { await this._handleOpenFile(data.value); } break;
-                case 'runCommand': if (data.value) { await this._handleRunCommand(data.value); } break;
+                case 'saveModel':
+                    await this._context.workspaceState.update('lastSelectedModel', data.model);
+                    if (data.model?.includes('||')) {
+                        const parts = data.model.split('||');
+                        this._currentUrl = parts[0];
+                        this._currentModel = parts[1];
+                    } else {
+                        this._currentModel = data.model || 'llama3';
+                        this._currentUrl = '';
+                    }
+                    break;
+                case 'restoreHistory':
+                    webviewView.webview.postMessage({ type: 'restoreHistory', history: this._history });
+                    break;
+                case 'createFile':
+                    if (data.value && data.target) await this._handleFileCreation(data.target, data.value);
+                    break;
+                case 'applyToActiveFile':
+                    if (data.value) await this._handleApplyEdit(data.value, data.targetFile);
+                    break;
+                case 'applyMultiFile':
+                    if (data.patches) await this._handleMultiFileApply(data.patches);
+                    break;
+                case 'requestFileAccess':
+                    if (data.target) await this._handleFileAccessRequest(data.target);
+                    break;
+                case 'clearHistory':
+                    this._history = [];
+                    this._updateHistory();
+                    break;
+                case 'openFile':
+                    if (data.value) await this._handleOpenFile(data.value);
+                    break;
+                case 'addRelatedFiles':
+                    await this._handleAddRelatedFiles();
+                    break;
+                case 'toggleThinkMode':
+                    this._thinkMode = !this._thinkMode;
+                    webviewView.webview.postMessage({ type: 'thinkModeChanged', active: this._thinkMode });
+                    break;
+                case 'analyzeError':
+                    if (data.value) await this.analyzeError(data.value);
+                    break;
+                case 'generateCommitMessage':
+                    await this._handleGenerateCommitMessage();
+                    break;
+                case 'reviewDiff':
+                    await this._handleReviewDiff();
+                    break;
+                case 'generateTests':
+                    await this._handleGenerateTests();
+                    break;
+                case 'updateProjectSummary':
+                    await this._handleUpdateProjectSummary();
+                    break;
+                case 'removeContextFile':
+                    this._contextFiles = this._contextFiles.filter(f => f.name !== data.name);
+                    break;
+                case 'getTokenBudget':
+                    this._sendTokenBudget();
+                    break;
+                case 'setTerminalPermission':
+                    this._terminalPermission = data.value || 'ask-all';
+                    this._context.workspaceState.update('terminalPermission', this._terminalPermission);
+                    break;
+                case 'getTerminalPermission':
+                    webviewView.webview.postMessage({ type: 'setTerminalPermission', value: this._terminalPermission });
+                    break;
+                case 'runCommand':
+                    if (data.value) await this._handleRunCommand(data.value, data.isImportant === true);
+                    break;
             }
         });
     }
@@ -196,65 +321,162 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._view?.webview.postMessage({ type: 'injectMessage', value: message });
     }
 
-    private async _handleSendMessage(userMsg: string, model?: string, targetUrl?: string) {
-        if (!userMsg || !this._view) { return; }
+    public activateThinkMode() {
+        this._thinkMode = true;
+        this._view?.webview.postMessage({ type: 'thinkModeChanged', active: true });
+    }
 
-        let resolvedModel = model || '';
-        let resolvedUrl = targetUrl || '';
+    public addFilesToContext(files: ContextFile[]) {
+        for (const f of files) {
+            if (!this._contextFiles.find(x => x.name === f.name)) {
+                this._contextFiles.push(f);
+            }
+        }
+        this._view?.webview.postMessage({
+            type: 'updateContextFiles',
+            files: this._contextFiles.map(f => ({ name: f.name, tokens: estimateTokens(f.content) }))
+        });
+        this._sendTokenBudget();
+    }
+
+    public async analyzeError(errorText: string) {
+        if (!this._view) return;
+
+        this._view.webview.postMessage({ type: 'statusMessage', value: '🔍 Analyse de l\'erreur en cours...' });
+
+        const relatedFiles = await this._fileCtxManager.findFilesForError(errorText);
+
+        if (relatedFiles.length > 0) {
+            this.addFilesToContext(relatedFiles);
+            this._view.webview.postMessage({
+                type: 'statusMessage',
+                value: `📁 ${relatedFiles.length} fichier(s) détecté(s) automatiquement : ${relatedFiles.map(f => f.name).join(', ')}`
+            });
+        }
+
+        setTimeout(() => {
+            this.sendMessageFromEditor(
+                `Analyse cette erreur et propose un correctif :\n\`\`\`\n${errorText}\n\`\`\``
+            );
+        }, 500);
+    }
+
+    private async _handleSendMessage(
+        userMsg: string,
+        model?: string,
+        targetUrl?: string,
+        webviewContextFiles?: Array<{ name: string; content: string }>,
+        thinkMode?: boolean
+    ) {
+        if (!userMsg || !this._view) return;
+
+        let resolvedModel = model || this._currentModel || 'llama3';
+        let resolvedUrl = targetUrl || this._currentUrl || '';
         if (resolvedModel.includes('||')) {
             const parts = resolvedModel.split('||');
             resolvedUrl = parts[0];
             resolvedModel = parts[1];
         }
 
+        const isCloud = this._ollamaClient.isCloud(resolvedUrl || undefined);
+        const budget = this._ollamaClient.getTokenBudget(resolvedModel, resolvedUrl || undefined);
+
+        const allContextFiles: ContextFile[] = [...this._contextFiles];
+        if (webviewContextFiles) {
+            for (const f of webviewContextFiles) {
+                if (!allContextFiles.find(x => x.name === f.name)) {
+                    allContextFiles.push({ name: f.name, content: f.content, isActive: false });
+                }
+            }
+        }
+
+        const maxPerFile = isCloud ? 40000 : 8000;
+        const activeFile = await this._fileCtxManager.getActiveFile(maxPerFile);
+        if (activeFile && !allContextFiles.find(f => f.name === activeFile.name)) {
+            allContextFiles.unshift(activeFile);
+        }
+
+        if (activeFile && (isCloud || allContextFiles.length < 3)) {
+            const editor = vscode.window.activeTextEditor;
+            if (editor) {
+                const related = await this._fileCtxManager.getRelatedFiles(editor.document, maxPerFile);
+                for (const r of related) {
+                    if (!allContextFiles.find(f => f.name === r.name)) {
+                        allContextFiles.push(r);
+                    }
+                }
+            }
+        }
+
+        const maxFiles = isCloud ? 10 : 3;
+        const limitedFiles = allContextFiles.slice(0, maxFiles);
+
+        const formattedHistory = this._getFormattedHistory();
+        const { context, budget: usedBudget } = this._ollamaClient.buildContext(
+            limitedFiles,
+            formattedHistory,
+            resolvedModel,
+            resolvedUrl || undefined
+        );
+
+        const projectSummary = this._fileCtxManager.getProjectSummary();
+        const workspaceTree = await this._fileCtxManager.getWorkspaceTree();
+        const treeStr = workspaceTree.slice(0, 100).join('\n');
+
+        const thinkPrefix = (thinkMode || this._thinkMode)
+            ? 'MODE RÉFLEXION ACTIVÉ : Commence par un bloc [PLAN] listant TOUTES les modifications que tu prévois de faire (fichiers, fonctions, raisons), puis [/PLAN]. Ensuite seulement, fournis le code.\n\n'
+            : '';
+
+        const fullContext = [
+            projectSummary ? `[MÉMOIRE PROJET]\n${projectSummary}` : '',
+            '[STRUCTURE]',
+            treeStr,
+            '',
+            '[HISTORIQUE RÉCENT]',
+            formattedHistory,
+            '',
+            '[FICHIERS EN CONTEXTE]',
+            context
+        ].filter(Boolean).join('\n');
+
+        const finalPrompt = thinkPrefix + userMsg;
+
         this._history.push({ role: 'user', value: userMsg });
         this._updateHistory();
         this._view.webview.postMessage({ type: 'startResponse' });
-
-        const workspaceFiles = await this._getWorkspaceFiles();
-        let editor = vscode.window.activeTextEditor;
-        if (!editor && vscode.window.visibleTextEditors.length > 0) {
-            editor = vscode.window.visibleTextEditors[0];
-        }
-
-        let activeContext = '';
-        if (editor && editor.document.uri.scheme === 'file') {
-            const doc = editor.document;
-            const fullText = doc.getText();
-            const MAX_CHARS = 12000;
-            const truncated = fullText.length > MAX_CHARS
-                ? fullText.substring(0, MAX_CHARS) + '\n[... fichier tronqué ...]'
-                : fullText;
-            activeContext = `Fichier actif: ${vscode.workspace.asRelativePath(doc.fileName)}\nContenu:\n${truncated}`;
-        }
-
-        const fullContext = [
-            '[STRUCTURE]',
-            workspaceFiles.join('\n'),
-            '',
-            '[HISTORIQUE]',
-            this._getFormattedHistory(),
-            '',
-            '[CONTEXTE]',
-            activeContext
-        ].join('\n');
+        this._view.webview.postMessage({
+            type: 'tokenBudget',
+            used: estimateTokens(fullContext + finalPrompt),
+            max: Math.floor(budget.max / 4),
+            isCloud
+        });
 
         try {
             let fullRes = '';
-            const response = await this._ollamaClient.generateStreamingResponse(
-                userMsg,
+            await this._ollamaClient.generateStreamingResponse(
+                finalPrompt,
                 fullContext,
                 (chunk) => {
                     fullRes += chunk;
                     this._view?.webview.postMessage({ type: 'partialResponse', value: chunk });
                 },
                 resolvedModel,
-                resolvedUrl
+                resolvedUrl || undefined
             );
-            const finalResponse = response || fullRes;
-            this._history.push({ role: 'ai', value: finalResponse });
+
+            this._history.push({ role: 'ai', value: fullRes });
             this._updateHistory();
-            this._view.webview.postMessage({ type: 'endResponse', value: finalResponse });
+            this._view.webview.postMessage({ type: 'endResponse', value: fullRes });
+
+            if (activeFile) {
+                const fileHist = this._fileCtxManager.getFileHistory(activeFile.name);
+                fileHist.push({ role: 'user', value: userMsg });
+                fileHist.push({ role: 'ai', value: fullRes });
+                await this._fileCtxManager.saveFileHistory(activeFile.name, fileHist);
+            }
+
+            await this._processAiResponse(fullRes);
+
         } catch (e: any) {
             const msg = e?.message ?? String(e);
             vscode.window.showErrorMessage(`Antigravity: ${msg}`);
@@ -262,59 +484,351 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async _handleCloudConnection() {
-        const config = vscode.workspace.getConfiguration('local-ai');
-        const apiKeys: Array<{ name: string; key: string; url: string; expiresAt?: number }> =
-            config.get<any[]>('apiKeys') || [];
+    private async _processAiResponse(response: string) {
+        const parsed = parseAiResponse(response);
 
-        interface QuickPickItemWithKey extends vscode.QuickPickItem {
-            keyEntry?: { name: string; key: string; url: string; expiresAt?: number };
+        for (const filePath of parsed.needFiles) {
+            const file = await this._fileCtxManager.handleAiFileRequest(filePath);
+            if (file) {
+                this.addFilesToContext([{ ...file, isActive: false }]);
+                this._view?.webview.postMessage({
+                    type: 'statusMessage',
+                    value: `📁 Fichier "${file.name}" ajouté au contexte IA.`
+                });
+            }
         }
 
-        const now = Date.now();
-        const items: QuickPickItemWithKey[] = [
-            ...apiKeys.map(k => ({
-                label: `☁️  ${k.name}`,
-                description: k.url,
-                detail: k.expiresAt
-                    ? (k.expiresAt < now ? '⚠️ Clé expirée' : `Expire ${new Date(k.expiresAt).toLocaleDateString()}`)
-                    : undefined,
-                keyEntry: k
-            })),
-            { label: '$(add) Ajouter une clé API Cloud', description: 'Configurer un nouveau provider' }
+        for (const cf of parsed.createFiles) {
+            const answer = await vscode.window.showInformationMessage(
+                `L'IA veut créer : "${cf.name}". Confirmer ?`,
+                '✅ Créer', '❌ Ignorer'
+            );
+            if (answer === '✅ Créer') {
+                await this._handleFileCreation(cf.name, cf.content);
+            }
+        }
+
+        if (parsed.projectSummary) {
+            await this._fileCtxManager.saveProjectSummary(parsed.projectSummary);
+            vscode.window.showInformationMessage('✅ Mémoire du projet mise à jour par l\'IA.');
+        }
+
+        if (parsed.plan) {
+            this._view?.webview.postMessage({ type: 'showPlan', plan: parsed.plan });
+        }
+
+        for (const { cmd, isImportant } of parsed.commands) {
+            await this._handleRunCommand(cmd, isImportant);
+        }
+        const multiPatches = extractMultiFilePatches(response);
+        if (multiPatches.size > 1) {
+            const fileList = Array.from(multiPatches.keys()).join(', ');
+            const answer = await vscode.window.showInformationMessage(
+                `L'IA propose des modifications sur ${multiPatches.size} fichiers : ${fileList}`,
+                '📋 Appliquer tout', '👁 Voir fichier par fichier', '❌ Ignorer'
+            );
+
+            if (answer === '📋 Appliquer tout') {
+                await this._handleMultiFileApply(
+                    Array.from(multiPatches.entries()).map(([name, patch]) => ({ name, patch }))
+                );
+            } else if (answer === '👁 Voir fichier par fichier') {
+                for (const [fileName, patch] of multiPatches) {
+                    await this._handleApplyEdit(patch, fileName);
+                }
+            }
+        }
+    }
+
+    private async _handleMultiFileApply(patches: Array<{ name: string; patch: string }>) {
+        let applied = 0;
+        for (const { name, patch } of patches) {
+            try {
+                await this._handleApplyEdit(patch, name);
+                applied++;
+            } catch (e: any) {
+                vscode.window.showErrorMessage(`Erreur sur ${name}: ${e.message}`);
+            }
+        }
+        if (applied > 0) {
+            vscode.window.showInformationMessage(`✅ ${applied} fichier(s) modifié(s) avec succès.`);
+        }
+    }
+
+    private async _handleAddRelatedFiles() {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showWarningMessage('Aucun fichier actif.');
+            return;
+        }
+        const isCloud = this._ollamaClient.isCloud(this._currentUrl || undefined);
+        const maxChars = isCloud ? 40000 : 8000;
+        const related = await this._fileCtxManager.getRelatedFiles(editor.document, maxChars);
+
+        if (related.length === 0) {
+            vscode.window.showInformationMessage('Aucun import local détecté dans ce fichier.');
+            return;
+        }
+
+        this.addFilesToContext(related);
+        this._view?.webview.postMessage({
+            type: 'statusMessage',
+            value: `🔗 ${related.length} fichier(s) lié(s) ajouté(s) : ${related.map(f => f.name).join(', ')}`
+        });
+    }
+
+    private async _handleCloudConnection() {
+        await this._showKeyManagerMenu();
+    }
+
+    private async _showKeyManagerMenu() {
+        interface KeyMenuItem extends vscode.QuickPickItem {
+            action: 'select' | 'add' | 'manage';
+            keyIdx?: number;
+        }
+
+        const statuses = this._ollamaClient.getApiKeyStatuses();
+
+        const keyItems: KeyMenuItem[] = statuses.map((s, i) => ({
+            label: `${s.statusIcon} ${s.entry.name}`,
+            description: s.entry.url,
+            detail: `${s.statusLabel}${s.cooldownSecsLeft ? '' : ''}  ·  Ajouté ${s.entry.addedAt ? new Date(s.entry.addedAt).toLocaleDateString('fr-FR') : 'N/A'}`,
+            action: 'select',
+            keyIdx: i,
+        }));
+
+        const items: KeyMenuItem[] = [
+            ...keyItems,
+            { label: '', kind: vscode.QuickPickItemKind.Separator } as any,
+            {
+                label: '$(add)  Ajouter une clé API',
+                description: 'Configurer un nouveau provider cloud',
+                action: 'add',
+            },
+            {
+                label: '$(gear)  Gérer les clés existantes',
+                description: 'Modifier / Supprimer / Réinitialiser le cooldown',
+                action: 'manage',
+            },
         ];
 
         const picked = await vscode.window.showQuickPick(items, {
-            title: 'Connexion Cloud',
-            placeHolder: 'Sélectionner un compte ou en ajouter un'
+            title: '☁️ Gestion des clés API Cloud',
+            placeHolder: statuses.length === 0
+                ? 'Aucune clé configurée — ajoutez-en une'
+                : 'Sélectionner un compte ou gérer les clés',
+            matchOnDescription: true,
+            matchOnDetail: false,
         });
+        if (!picked) return;
 
-        if (!picked) { return; }
+        if (picked.action === 'add') {
+            await this._handleAddKey();
+        } else if (picked.action === 'manage') {
+            await this._handleManageKeys();
+        } else if (picked.action === 'select' && picked.keyIdx !== undefined) {
+            const entry = statuses[picked.keyIdx].entry;
+            const status = statuses[picked.keyIdx];
+            if (status.status === 'cooldown') {
+                const choice = await vscode.window.showWarningMessage(
+                    `⚠️ "${entry.name}" est en cooldown encore ${status.cooldownSecsLeft}s. Utiliser quand même ?`,
+                    'Utiliser quand même', 'Réinitialiser le cooldown', 'Annuler'
+                );
+                if (!choice || choice === 'Annuler') return;
+                if (choice === 'Réinitialiser le cooldown') {
+                    await this._ollamaClient.resetKeyCooldown(entry.key, entry.url);
+                    vscode.window.showInformationMessage(`✅ Cooldown réinitialisé pour "${entry.name}".`);
+                }
+            }
+            await this._updateModelsList(entry.url, entry.key);
+        }
+    }
 
-        if (picked.keyEntry) {
-            await this._updateModelsList(picked.keyEntry.url, picked.keyEntry.key);
-        } else {
-            const name = await vscode.window.showInputBox({ prompt: 'Nom du provider (ex: OpenAI, Mistral…)' });
-            if (!name) { return; }
-            const url = await vscode.window.showInputBox({
-                prompt: "URL de base de l'API",
-                value: 'https://api.openai.com/v1'
+    private async _handleAddKey() {
+        const name = await vscode.window.showInputBox({
+            title: 'Ajouter un provider — 1/3',
+            prompt: 'Nom du provider',
+            placeHolder: 'ex: OpenAI perso, Ollama VPS, OpenRouter #2…',
+            ignoreFocusOut: true,
+        });
+        if (!name) return;
+
+        interface UrlPreset extends vscode.QuickPickItem {
+            description: string;
+            needsKey: boolean;
+        }
+        const PRESET_URLS: UrlPreset[] = [
+            {
+                label: '⚡ Ollama distant (sans clé)', description: '', needsKey: false,
+                detail: 'Serveur Ollama auto-hébergé ou cloud — clé non requise'
+            },
+            { label: 'OpenAI', description: 'https://api.openai.com/v1', needsKey: true },
+            { label: 'OpenRouter', description: 'https://openrouter.ai/api/v1', needsKey: true },
+            { label: 'Together AI', description: 'https://api.together.xyz/v1', needsKey: true },
+            { label: 'Mistral', description: 'https://api.mistral.ai/v1', needsKey: true },
+            { label: 'Groq', description: 'https://api.groq.com/openai/v1', needsKey: true },
+            {
+                label: 'Autre / Personnalisé…', description: '', needsKey: true,
+                detail: 'Entrer une URL manuellement'
+            },
+        ];
+
+        const urlPick = await vscode.window.showQuickPick(PRESET_URLS, {
+            title: 'Ajouter un provider — 2/3',
+            placeHolder: 'Choisir le type de provider',
+            matchOnDetail: true,
+        });
+        if (!urlPick) return;
+
+        let url = urlPick.description;
+        if (!url) {
+            const isOllama = urlPick.label.startsWith('⚡');
+            const custom = await vscode.window.showInputBox({
+                title: "URL de base de l'API",
+                prompt: isOllama
+                    ? 'URL de votre serveur Ollama (ex: http://mon-vps:11434)'
+                    : "URL de base de l'API (sans slash final)",
+                placeHolder: isOllama ? 'http://mon-serveur:11434' : 'https://mon-serveur.com/v1',
+                ignoreFocusOut: true,
             });
-            if (!url) { return; }
-            const key = await vscode.window.showInputBox({ prompt: 'Clé API', password: true });
-            if (!key) { return; }
+            if (!custom) return;
+            url = custom;
+        }
 
-            const updated = [...apiKeys, { name, url, key }];
-            await config.update('apiKeys', updated, vscode.ConfigurationTarget.Global);
-            vscode.window.showInformationMessage(`✅ Provider "${name}" ajouté.`);
-            await this._updateModelsList(url, key);
+        const keyRequired = urlPick.needsKey;
+        const key = await vscode.window.showInputBox({
+            title: 'Ajouter un provider — 3/3',
+            prompt: keyRequired
+                ? `Clé API pour "${name}"`
+                : `Clé API pour "${name}" (optionnelle — laisser vide si Ollama sans auth)`,
+            placeHolder: keyRequired ? 'sk-…' : '(optionnel)',
+            password: true,
+            ignoreFocusOut: true,
+        });
+        if (key === undefined) return;
+
+        const result = await this._ollamaClient.addApiKey({ name, url, key: key || '' });
+        if (!result.success) {
+            vscode.window.showWarningMessage(`⚠️ ${result.reason}`);
+            return;
+        }
+
+        vscode.window.showInformationMessage(`✅ Provider "${name}" ajouté.`);
+        await this._updateModelsList(url, key || undefined);
+    }
+
+    private async _handleManageKeys() {
+        const statuses = this._ollamaClient.getApiKeyStatuses();
+        if (statuses.length === 0) {
+            const addNow = await vscode.window.showInformationMessage(
+                'Aucune clé configurée. Ajouter une clé ?', 'Ajouter', 'Annuler'
+            );
+            if (addNow === 'Ajouter') await this._handleAddKey();
+            return;
+        }
+
+        interface ManageItem extends vscode.QuickPickItem {
+            statusIdx: number;
+        }
+
+        const items: ManageItem[] = statuses.map((s, i) => ({
+            label: `${s.statusIcon} ${s.entry.name}`,
+            description: s.entry.url,
+            detail: s.statusLabel + (s.entry.key ? `  ·  Clé: ${s.entry.key.substring(0, 8)}${'·'.repeat(8)}` : ''),
+            statusIdx: i,
+        }));
+
+        const picked = await vscode.window.showQuickPick(items, {
+            title: '🔑 Gérer les clés — Sélectionner une clé',
+            placeHolder: 'Choisir la clé à modifier',
+        });
+        if (!picked) return;
+
+        const target = statuses[picked.statusIdx];
+        await this._handleKeyActions(target);
+    }
+
+    private async _handleKeyActions(target: ApiKeyStatus) {
+        const entry = target.entry;
+        const actions: vscode.QuickPickItem[] = [
+            {
+                label: '✏️  Renommer',
+                description: `Nom actuel : "${entry.name}"`,
+            },
+            {
+                label: '🔑  Changer la clé API',
+                description: `Clé actuelle : ${entry.key.substring(0, 8)}·····`,
+            },
+            ...(target.status === 'cooldown' ? [{
+                label: '🔄  Réinitialiser le cooldown',
+                description: `Restant : ${target.cooldownSecsLeft}s`,
+            }] : []),
+            {
+                label: '🗑️  Supprimer cette clé',
+                description: `"${entry.name}" — ${entry.url}`,
+            },
+            {
+                label: '↩️  Retour',
+            },
+        ];
+
+        const action = await vscode.window.showQuickPick(actions, {
+            title: `⚙️ Actions — ${entry.name}`,
+        });
+        if (!action || action.label === '↩️  Retour') {
+            await this._handleManageKeys();
+            return;
+        }
+
+        if (action.label.startsWith('✏️')) {
+            const newName = await vscode.window.showInputBox({
+                prompt: 'Nouveau nom',
+                value: entry.name,
+                ignoreFocusOut: true,
+            });
+            if (!newName || newName === entry.name) return;
+            await this._ollamaClient.updateApiKey(entry.key, entry.url, { name: newName });
+            vscode.window.showInformationMessage(`✅ Renommé en "${newName}".`);
+
+        } else if (action.label.startsWith('🔑')) {
+            const newKey = await vscode.window.showInputBox({
+                prompt: `Nouvelle clé API pour "${entry.name}"`,
+                placeHolder: 'sk-…',
+                password: true,
+                ignoreFocusOut: true,
+            });
+            if (!newKey) return;
+            await this._ollamaClient.deleteApiKey(entry.key, entry.url);
+            await this._ollamaClient.addApiKey({ name: entry.name, url: entry.url, key: newKey, platform: entry.platform });
+            vscode.window.showInformationMessage(`✅ Clé mise à jour pour "${entry.name}".`);
+            await this._updateModelsList(entry.url, newKey);
+
+        } else if (action.label.startsWith('🔄')) {
+            await this._ollamaClient.resetKeyCooldown(entry.key, entry.url);
+            vscode.window.showInformationMessage(`✅ Cooldown réinitialisé — "${entry.name}" est disponible.`);
+
+        } else if (action.label.startsWith('🗑️')) {
+            const confirm = await vscode.window.showWarningMessage(
+                `Supprimer la clé "${entry.name}" ? Cette action est irréversible.`,
+                { modal: true },
+                '🗑️ Supprimer', 'Annuler'
+            );
+            if (confirm !== '🗑️ Supprimer') return;
+            await this._ollamaClient.deleteApiKey(entry.key, entry.url);
+            vscode.window.showInformationMessage(`🗑️ Clé "${entry.name}" supprimée.`);
+            await this._updateModelsList();
         }
     }
 
     private async _updateModelsList(cloudUrl?: string, cloudKey?: string) {
-        if (!this._view) { return; }
+        if (!this._view) return;
 
         try {
+            const savedKeys = this._ollamaClient.getApiKeys();
+            const tmpKey = cloudUrl && cloudKey && !savedKeys.find(k => k.url === cloudUrl && k.key === cloudKey)
+                ? { name: 'Cloud', url: cloudUrl, key: cloudKey }
+                : undefined;
+
             const allModels = await this._ollamaClient.listAllModels();
             const formattedModels: Array<{
                 label: string; value: string; name: string; url: string; isLocal: boolean;
@@ -326,54 +840,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 isLocal: m.isLocal
             }));
 
-            const config = vscode.workspace.getConfiguration('local-ai');
-            const savedKeys: Array<{ name: string; key: string; url: string }> =
-                config.get<any[]>('apiKeys') || [];
-
-            const providersToFetch = [...savedKeys];
-            if (cloudUrl && cloudKey && !providersToFetch.find(k => k.url === cloudUrl)) {
-                providersToFetch.push({ name: 'Cloud', url: cloudUrl, key: cloudKey });
-            }
-
-            for (const provider of providersToFetch) {
+            if (tmpKey) {
                 try {
-                    const isOpenAI = provider.url.includes('together') || provider.url.includes('openrouter') || provider.url.endsWith('/v1');
-                    const endpoint = isOpenAI ? `${provider.url}/models` : `${provider.url}/api/tags`;
-                    const res = await fetch(endpoint, {
-                        headers: { 'Authorization': `Bearer ${provider.key}` },
-                        signal: AbortSignal.timeout(4000)
-                    });
+                    const isOpenAI = tmpKey.url.includes('together') || tmpKey.url.includes('openrouter') || tmpKey.url.endsWith('/v1');
+                    const endpoint = isOpenAI ? `${tmpKey.url}/models` : `${tmpKey.url}/api/tags`;
+                    const tmpHeaders: Record<string, string> = {};
+                    if (tmpKey.key) tmpHeaders['Authorization'] = `Bearer ${tmpKey.key}`;
+                    const res = await fetch(endpoint, { headers: tmpHeaders, signal: AbortSignal.timeout(4000) });
                     if (res.ok) {
                         const data: any = await res.json();
                         const cloudList: string[] = isOpenAI
                             ? (data?.data || []).map((m: any) => m.id as string).filter(Boolean)
                             : (data?.models || []).map((m: any) => (m.name ?? m.id) as string).filter(Boolean);
                         cloudList.forEach(m => {
-                            const val = `${provider.url}||${m}`;
+                            const val = `${tmpKey.url}||${m}`;
                             if (!formattedModels.find(x => x.value === val)) {
-                                formattedModels.push({
-                                    label: `☁️  ${m}`,
-                                    value: val,
-                                    name: m,
-                                    url: provider.url,
-                                    isLocal: false
-                                });
+                                formattedModels.push({ label: `☁️  ${m}`, value: val, name: m, url: tmpKey.url, isLocal: false });
                             }
                         });
                     }
-                } catch { /* provider unreachable — skip silently */ }
+                } catch { }
             }
 
             const lastSelected = this._context.workspaceState.get<string>('lastSelectedModel');
             let selected = formattedModels.length > 0 ? formattedModels[0].value : '';
-            if (lastSelected && formattedModels.find(m => m.value === lastSelected)) {
-                selected = lastSelected;
-            }
+            if (lastSelected && formattedModels.find(m => m.value === lastSelected)) selected = lastSelected;
 
             this._view.webview.postMessage({ type: 'setModels', models: formattedModels, selected });
         } catch {
             this._view.webview.postMessage({ type: 'setModels', models: [], selected: '' });
         }
+    }
+
+    private _sendTokenBudget() {
+        if (!this._view) return;
+        const isCloud = this._ollamaClient.isCloud(this._currentUrl || undefined);
+        const budget = this._ollamaClient.getTokenBudget(this._currentModel || 'llama3', this._currentUrl || undefined);
+        const usedChars = this._contextFiles.reduce((sum, f) => sum + f.content.length, 0);
+        this._view.webview.postMessage({
+            type: 'tokenBudget',
+            used: estimateTokens(usedChars.toString()),
+            max: Math.floor(budget.max / 4),
+            isCloud
+        });
     }
 
     private _updateHistory() {
@@ -400,23 +909,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async _handleFileAccessRequest(target: string) {
-        if (target === '.env') {
-            const files = await vscode.workspace.findFiles('**/.env');
-            if (files.length > 0) {
-                const content = await vscode.workspace.fs.readFile(files[0]);
-                this._view?.webview.postMessage({ type: 'fileContent', name: '.env', content: content.toString() });
-            } else {
-                vscode.window.showErrorMessage('.env introuvable.');
+        if (target === 'env' || target === '.env') {
+            const file = await this._fileCtxManager.handleAiFileRequest('.env');
+            if (file) {
+                this._view?.webview.postMessage({ type: 'fileContent', name: file.name, content: file.content });
             }
         } else {
             const uris = await vscode.window.showOpenDialog({ canSelectFiles: true, openLabel: 'Ajouter au contexte' });
             if (uris?.[0]) {
                 const content = await vscode.workspace.fs.readFile(uris[0]);
-                this._view?.webview.postMessage({
-                    type: 'fileContent',
-                    name: path.basename(uris[0].fsPath),
-                    content: content.toString()
-                });
+                const name = vscode.workspace.asRelativePath(uris[0]);
+                const cf: ContextFile = { name, content: content.toString(), isActive: false };
+                this._contextFiles.push(cf);
+                this._view?.webview.postMessage({ type: 'fileContent', name, content: content.toString() });
+                this._sendTokenBudget();
             }
         }
     }
@@ -479,7 +985,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             vscode.window.showInformationMessage(
                 `✅ ${patchCount > 0 ? `${patchCount} patch(s) appliqué(s)` : 'Fichier remplacé'} et sauvegardé !`
             );
+            const summary = this._buildPatchSummary(path.basename(uri.fsPath), oldText, previewText, patchCount);
+            this._view?.webview.postMessage({ type: 'patchSummary', summary });
         }
+    }
+
+    private _buildPatchSummary(fileName: string, oldText: string, newText: string, patchCount: number): string {
+        const oldLines = oldText.split('\n');
+        const newLines = newText.split('\n');
+        let added = 0, removed = 0;
+        const oldSet = new Set(oldLines);
+        const newSet = new Set(newLines);
+        for (const l of newLines) { if (!oldSet.has(l)) added++; }
+        for (const l of oldLines) { if (!newSet.has(l)) removed++; }
+        const delta = newLines.length - oldLines.length;
+        const sign = delta >= 0 ? '+' : '';
+        return `${patchCount} bloc(s) modifié(s) dans **${fileName}** · +${added} / -${removed} lignes (${sign}${delta})`;
     }
 
     private _highlightChangedLines(editor: vscode.TextEditor, oldText: string, newText: string) {
@@ -492,7 +1013,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 changedRanges.push(editor.document.lineAt(i).range);
             }
         }
-        if (changedRanges.length === 0) { return; }
+        if (changedRanges.length === 0) return;
 
         const dec = vscode.window.createTextEditorDecorationType({
             backgroundColor: 'rgba(0, 255, 120, 0.12)',
@@ -514,24 +1035,82 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async _handleRunCommand(cmd: string) {
-        const answer = await vscode.window.showInformationMessage(
-            `Exécuter : ${cmd}`, '🚀 Exécuter', 'Annuler'
-        );
-        if (answer === '🚀 Exécuter') {
+    private async _handleRunCommand(cmd: string, isImportant: boolean = false) {
+        const perm = this._terminalPermission;
+
+        let shouldRun = false;
+
+        if (perm === 'allow-all') {
+            shouldRun = true;
+            this._view?.webview.postMessage({
+                type: 'terminalCommand',
+                cmd,
+                status: 'auto',
+            });
+        } else if (perm === 'ask-important' && !isImportant) {
+            shouldRun = true;
+            this._view?.webview.postMessage({
+                type: 'terminalCommand',
+                cmd,
+                status: 'auto',
+            });
+        } else {
+            const answer = await vscode.window.showInformationMessage(
+                `${isImportant ? '⚠️ Commande importante' : '💻 Terminal'} — Exécuter : \`${cmd}\``,
+                { modal: isImportant },
+                '🚀 Exécuter', '❌ Refuser'
+            );
+            shouldRun = answer === '🚀 Exécuter';
+            this._view?.webview.postMessage({
+                type: 'terminalCommand',
+                cmd,
+                status: shouldRun ? 'accepted' : 'refused',
+            });
+        }
+
+        if (shouldRun) {
             const t = vscode.window.activeTerminal ?? vscode.window.createTerminal('Antigravity AI');
             t.show();
             t.sendText(cmd);
         }
     }
 
-    private async _getWorkspaceFiles(): Promise<string[]> {
-        const files = await vscode.workspace.findFiles(
-            '**/*',
-            '{**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/.next/**}',
-            200
+    private async _handleGenerateCommitMessage() {
+        const diff = await this._fileCtxManager.getStagedDiffForCommit();
+        if (!diff) {
+            vscode.window.showWarningMessage('Aucun fichier stagé. Faites d\'abord un `git add`.');
+            return;
+        }
+        this.sendMessageFromEditor(
+            `Génère un message de commit conventionnel (feat/fix/refactor/chore/docs/test) pour ce diff stagé. Réponds UNIQUEMENT avec le message de commit, sans explications :\n\`\`\`diff\n${diff.substring(0, 6000)}\n\`\`\``
         );
-        return files.map(u => vscode.workspace.asRelativePath(u)).sort();
+    }
+
+    private async _handleReviewDiff() {
+        const diff = await this._fileCtxManager.getGitDiff(false);
+        if (!diff) {
+            vscode.window.showWarningMessage('Aucune modification Git trouvée.');
+            return;
+        }
+        this.sendMessageFromEditor(
+            `Revois ce diff Git. Identifie : bugs potentiels, problèmes de sécurité, mauvaises pratiques, oublis.\n\`\`\`diff\n${diff.substring(0, 8000)}\n\`\`\``
+        );
+    }
+
+    private async _handleGenerateTests() {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) { vscode.window.showWarningMessage('Aucun fichier actif.'); return; }
+        const fileName = path.basename(editor.document.fileName, path.extname(editor.document.fileName));
+        const ext = path.extname(editor.document.fileName);
+        this.sendMessageFromEditor(
+            `Génère des tests unitaires complets pour le fichier actif. Crée le fichier [CREATE_FILE: ${fileName}.test${ext}] avec des cas de test couvrant les cas normaux, les cas limites, et les cas d'erreur. Utilise le framework de test approprié au projet.`
+        );
+    }
+
+    private async _handleUpdateProjectSummary() {
+        this.sendMessageFromEditor(
+            `Génère un résumé technique de ce projet en 200-300 mots. Inclus : technos principales, architecture, rôle des dossiers clés, patterns utilisés. Encadre ta réponse avec [PROJECT_SUMMARY] et [/PROJECT_SUMMARY].`
+        );
     }
 
     private _getHtmlForWebview(webview: vscode.Webview): string {
@@ -547,170 +1126,262 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "const send = document.getElementById('send');",
             "const modelSelect = document.getElementById('modelSelect');",
             "const filesBar = document.getElementById('filesBar');",
+            "const tokenBar = document.getElementById('tokenBar');",
+            "const terminalLog = document.getElementById('terminalLog');",
+            "const scrollBtn = document.getElementById('scrollBtn');",
+            "const termPermSelect = document.getElementById('termPermSelect');",
             "let contextFiles = [];",
             "let currentAiMsg = null;",
             "let currentAiText = '';",
+            "let thinkModeActive = false;",
+            "let userScrolledUp = false;",
             "",
+            "// ─── Scroll lock logic ───",
+            "chat.addEventListener('scroll', function() {",
+            "    var threshold = 60;",
+            "    var atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < threshold;",
+            "    userScrolledUp = !atBottom;",
+            "    scrollBtn.style.display = userScrolledUp ? 'flex' : 'none';",
+            "});",
+            "scrollBtn.onclick = function() {",
+            "    chat.scrollTop = chat.scrollHeight;",
+            "    userScrolledUp = false;",
+            "    scrollBtn.style.display = 'none';",
+            "};",
+            "function smartScroll() {",
+            "    if (!userScrolledUp) chat.scrollTop = chat.scrollHeight;",
+            "}",
+            "",
+            "// ─── Terminal permission select ───",
+            "termPermSelect.onchange = function() {",
+            "    vscode.postMessage({ type: 'setTerminalPermission', value: termPermSelect.value });",
+            "};",
+            "",
+            "// ─── Auto-resize textarea ───",
             "prompt.addEventListener('input', function() {",
             "    prompt.style.height = 'auto';",
             "    prompt.style.height = Math.min(prompt.scrollHeight, 120) + 'px';",
             "});",
             "",
+            "// ─── Context file management ───",
             "function addContextFile(name, content) {",
-            "    if (contextFiles.find(function(f) { return f.name === name; })) { return; }",
+            "    if (contextFiles.find(function(f) { return f.name === name; })) return;",
             "    contextFiles.push({ name: name, content: content });",
             "    renderFilesBar();",
+            "    vscode.postMessage({ type: 'getTokenBudget' });",
             "}",
             "",
             "function renderFilesBar() {",
             "    if (contextFiles.length === 0) { filesBar.style.display = 'none'; return; }",
             "    filesBar.style.display = 'flex';",
-            "    filesBar.innerHTML = '<span style=\"color:#666;margin-right:4px;\">Contexte :</span>' +",
+            "    filesBar.innerHTML = '<span style=\"color:#666;margin-right:4px;\">📁</span>' +",
             "        contextFiles.map(function(f, i) {",
-            "            return '<span class=\"file-tag\" data-idx=\"' + i + '\">' + f.name + ' \u2715</span>';",
-            "        }).join('');",
-            "    filesBar.querySelectorAll('.file-tag').forEach(function(el) {",
+            "            var tokens = Math.ceil(f.content.length / 4);",
+            "            return '<span class=\"file-tag\" data-idx=\"'+i+'\" title=\"'+tokens+' tokens\">'+f.name+' <span style=\"color:#888;font-size:10px\">('+tokens+'t)</span> ×</span>';",
+            "        }).join('') +",
+            "        '<button class=\"file-tag btn-clear-files\" onclick=\"clearAllFiles()\" style=\"color:#ff6b6b;border-color:#ff6b6b;\">Vider</button>';",
+            "    filesBar.querySelectorAll('.file-tag[data-idx]').forEach(function(el) {",
             "        el.onclick = function() {",
-            "            contextFiles.splice(parseInt(el.getAttribute('data-idx')), 1);",
+            "            var idx = parseInt(el.getAttribute('data-idx'));",
+            "            vscode.postMessage({ type: 'removeContextFile', name: contextFiles[idx].name });",
+            "            contextFiles.splice(idx, 1);",
             "            renderFilesBar();",
             "        };",
             "    });",
             "}",
             "",
+            "function clearAllFiles() {",
+            "    contextFiles.forEach(function(f) { vscode.postMessage({ type: 'removeContextFile', name: f.name }); });",
+            "    contextFiles = [];",
+            "    renderFilesBar();",
+            "}",
+            "",
+            "// ─── Token budget bar ───",
+            "function updateTokenBar(used, max, isCloud) {",
+            "    var pct = Math.min(100, Math.round(used / max * 100));",
+            "    var color = pct > 85 ? '#ff6b6b' : pct > 60 ? '#ffaa00' : '#00d2ff';",
+            "    var icon = isCloud ? '☁️' : '⚡';",
+            "    tokenBar.innerHTML = '<span style=\"color:#666;font-size:10px\">' + icon + ' Tokens : ' +",
+            "        '<span style=\"color:' + color + '\">' + used + '</span>/' + max +",
+            "        ' <div style=\"display:inline-block;width:60px;height:4px;background:#222;border-radius:2px;vertical-align:middle;margin-left:4px;\">'+",
+            "        '<div style=\"width:' + pct + '%;height:100%;background:' + color + ';border-radius:2px;\"></div></div>' +",
+            "        (pct > 85 ? ' ⚠️ Contexte saturé' : '') + '</span>';",
+            "    tokenBar.style.display = 'block';",
+            "}",
+            "",
+            "// ─── Message helpers ───",
             "function addMsg(txt, cls, isHtml) {",
             "    var d = document.createElement('div');",
             "    d.className = 'msg ' + cls;",
             "    if (isHtml) { d.innerHTML = txt; } else { d.innerText = txt; }",
             "    chat.appendChild(d);",
-            "    chat.scrollTop = chat.scrollHeight;",
+            "    smartScroll();",
             "    return d;",
+            "}",
+            "",
+            "function addStatusMsg(txt) {",
+            "    var d = document.createElement('div');",
+            "    d.className = 'status-msg';",
+            "    d.innerText = txt;",
+            "    chat.appendChild(d);",
+            "    smartScroll();",
+            "    setTimeout(function() { d.remove(); }, 5000);",
             "}",
             "",
             "function escapeHtml(t) {",
             "    return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');",
             "}",
             "",
-            "// Global code registry — avoids fragile inline onclick with special chars",
+            "// ─── Code registry ───",
             "window._codeRegistry = [];",
             "function _registerCode(content) {",
             "    window._codeRegistry.push(content);",
             "    return window._codeRegistry.length - 1;",
             "}",
-            "function _applyCode(idx) {",
-            "    var content = window._codeRegistry[idx];",
-            "    if (content !== undefined) { vscode.postMessage({ type: 'applyToActiveFile', value: content }); }",
-            "}",
-            "function _copyCode(btn, idx) {",
-            "    var content = window._codeRegistry[idx];",
-            "    if (content === undefined) { return; }",
-            "    navigator.clipboard.writeText(content).then(function() {",
-            "        btn.textContent = '\\u2713 Copi\\u00E9 !';",
-            "        setTimeout(function() { btn.textContent = 'Copier'; }, 2000);",
-            "    });",
-            "}",
             "",
+            "// ─── Markdown renderer ───",
             "function renderMarkdown(text) {",
-            "    var blocks = [];",
-            "    var FENCE = String.fromCharCode(96,96,96);",
-            "    var fenceRe = new RegExp(FENCE + '(\\\\w*)?\\\\n?([\\\\s\\\\S]*?)' + FENCE, 'g');",
-            "    var processed = text.replace(fenceRe, function(match, lang, inner) {",
-            "        lang = (lang || '').trim();",
-            "        var isPatch = inner.indexOf('<<<<') !== -1 || inner.indexOf('SEARCH') !== -1;",
-            "        var safeInner = escapeHtml(inner);",
-            "        // Store in registry — safe against any special chars",
-            "        var patchIdx = _registerCode(match);  // full block with fences for patch",
-            "        var codeIdx  = _registerCode(inner);  // inner only for plain code",
-            "        var blockHtml;",
-            "        if (isPatch) {",
-            "            blockHtml = '<div class=\"code-block patch\">' +",
-            "                '<div class=\"code-header\"><span>\uD83D\uDCC4 ' + (lang || 'Patch') + '</span>' +",
-            "                '<button onclick=\"_applyCode(' + patchIdx + ')\">\u26A1 Appliquer</button>' +",
-            "                '</div><div class=\"code-content\">' + safeInner + '</div></div>';",
-            "        } else {",
-            "            blockHtml = '<div class=\"code-block\">' +",
-            "                '<div class=\"code-header\"><span>' + (lang || 'code') + '</span>' +",
-            "                '<button onclick=\"_copyCode(this,' + codeIdx + ')\">Copier</button>' +",
-            "                '<button onclick=\"_applyCode(' + codeIdx + ')\">\u26A1 Appliquer</button>' +",
-            "                '</div><div class=\"code-content\">' + safeInner + '</div></div>';",
-            "        }",
-            "        blocks.push(blockHtml);",
-            "        return '%%%BLOCK_' + (blocks.length - 1) + '%%%';",
+            "    var html = '';",
+            "    // Strip [PLAN]...[/PLAN] blocks — shown separately",
+            "    text = text.replace(/\\[PLAN\\][\\s\\S]*?\\[\\/PLAN\\]/g, '');",
+            "    text = text.replace(/\\[PROJECT_SUMMARY\\][\\s\\S]*?\\[\\/PROJECT_SUMMARY\\]/g, '');",
+            "    // Strip [NEED_FILE:...] and [WILL_MODIFY:...] tags",
+            "    text = text.replace(/\\[NEED_FILE:[^\\]]+\\]/g, '');",
+            "    text = text.replace(/\\[WILL_MODIFY:[^\\]]+\\]/g, '');",
+            "    // Code blocks with [FILE: name] support",
+            "    text = text.replace(/\\[FILE:\\s*([^\\]]+)\\]\\s*```(\\w+)?\\n([\\s\\S]*?)```/g, function(_, fname, lang, code) {",
+            "        var idx = _registerCode(code);",
+            "        var fidx = _registerCode(fname);",
+            "        return '<div class=\"code-block patch\"><div class=\"code-header\"><span>📄 '+escapeHtml(fname)+'</span>" +
+            "            <button onclick=\"applyFilePatch('+idx+','+fidx+')\">✅ Appliquer</button></div>" +
+            "            <div class=\"code-content\">'+escapeHtml(code)+'</div></div>';",
             "    });",
-            "    var t = processed",
-            "        .replace(/&(?!amp;|lt;|gt;|quot;|#)/g, '&amp;')",
-            "        .replace(/</g, '&lt;').replace(/>/g, '&gt;');",
-            "    t = t.replace(/\\*\\*(.*?)\\*\\*/g, '<b>$1</b>');",
-            "    t = t.replace(/\\*(.*?)\\*/g, '<i>$1</i>');",
-            "    var BT = String.fromCharCode(96);",
-            "    t = t.replace(new RegExp(BT+'([^'+BT+'\\\\n]+)'+BT,'g'), '<code>$1</code>');",
-            "    t = t.replace(/\\n/g, '<br>');",
-            "    t = t.replace(/%%%BLOCK_(\\d+)%%%/g, function(_, idx) { return blocks[parseInt(idx)] || ''; });",
-            "    return t;",
+            "    // Regular code blocks",
+            "    text = text.replace(/```(\\w+)?\\n([\\s\\S]*?)```/g, function(_, lang, code) {",
+            "        var idx = _registerCode(code);",
+            "        var isPatch = /SEARCH/.test(code);",
+            "        var cls = isPatch ? 'patch' : '';",
+            "        var btns = '<button onclick=\"applyCode('+idx+')\">✅ Appliquer</button>';",
+            "        if (isPatch) btns += ' <button onclick=\"copyCode('+idx+')\">📋 Copier</button>';",
+            "        else btns = '<button onclick=\"copyCode('+idx+')\">📋 Copier</button> ' + btns;",
+            "        return '<div class=\"code-block '+cls+'\"><div class=\"code-header\"><span>'+(lang||'code')+'</span>'+btns+'</div><div class=\"code-content\">'+escapeHtml(code)+'</div></div>';",
+            "    });",
+            "    // Inline formatting",
+            "    text = text.replace(/`([^`]+)`/g, '<code>$1</code>');",
+            "    text = text.replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>');",
+            "    text = text.replace(/\\*([^*]+)\\*/g, '<i>$1</i>');",
+            "    // Paragraphs",
+            "    var paras = text.split('\\n\\n');",
+            "    html = paras.map(function(p) {",
+            "        p = p.trim();",
+            "        if (!p) return '';",
+            "        if (p.startsWith('<div')) return p;",
+            "        p = p.replace(/\\n/g, '<br>');",
+            "        return '<p>' + p + '</p>';",
+            "    }).join('');",
+            "    return html;",
             "}",
             "",
-            "function doSend() {",
-            "    var v = prompt.value.trim();",
-            "    if (!v) { return; }",
-            "    var opt = modelSelect.options[modelSelect.selectedIndex];",
-            "    var modelVal = opt ? opt.value : '';",
-            "    if (!modelVal) {",
-            "        modelSelect.style.borderColor = '#ff6b6b';",
-            "        setTimeout(function() { updateSelectColor(); }, 2000);",
-            "        return;",
-            "    }",
-            "    addMsg(v, 'user', false);",
-            "    var url = opt.getAttribute('data-url') || '';",
-            "    var actualModel = opt.getAttribute('data-name') || '';",
-            "    var extraCtx = contextFiles.map(function(f) {",
-            "        return '\\n[FICHIER: ' + f.name + ']\\n' + f.content.substring(0, 8000);",
-            "    }).join('\\n');",
-            "    vscode.postMessage({ type: 'sendMessage', value: v + extraCtx, model: actualModel, url: url });",
+            "function applyCode(idx) {",
+            "    vscode.postMessage({ type: 'applyToActiveFile', value: window._codeRegistry[idx] });",
+            "}",
+            "function applyFilePatch(codeIdx, fileIdx) {",
+            "    var code = window._codeRegistry[codeIdx];",
+            "    var fname = window._codeRegistry[fileIdx];",
+            "    vscode.postMessage({ type: 'applyToActiveFile', value: code, targetFile: fname });",
+            "}",
+            "function copyCode(idx) {",
+            "    navigator.clipboard.writeText(window._codeRegistry[idx]);",
+            "}",
+            "",
+            "// ─── Send message ───",
+            "function sendMessage() {",
+            "    var val = prompt.value.trim();",
+            "    if (!val) return;",
+            "    addMsg(val, 'user', false);",
+            "    var selectedOpt = modelSelect.options[modelSelect.selectedIndex];",
+            "    var modelVal = modelSelect.value;",
+            "    var modelUrl = selectedOpt ? (selectedOpt.getAttribute('data-url') || '') : '';",
+            "    vscode.postMessage({",
+            "        type: 'sendMessage',",
+            "        value: val,",
+            "        model: modelVal,",
+            "        url: modelUrl,",
+            "        contextFiles: contextFiles,",
+            "        thinkMode: thinkModeActive",
+            "    });",
             "    prompt.value = '';",
             "    prompt.style.height = 'auto';",
             "}",
             "",
-            "send.onclick = doSend;",
+            "send.onclick = sendMessage;",
             "prompt.addEventListener('keydown', function(e) {",
-            "    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); }",
+            "    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }",
             "});",
-            "document.getElementById('btnCloud').onclick = function() { vscode.postMessage({ type: 'openCloudConnect' }); };",
-            "document.getElementById('btnClearHistory').onclick = function() {",
-            "    chat.innerHTML = ''; vscode.postMessage({ type: 'clearHistory' });",
-            "};",
+            "",
+            "// ─── Action buttons ───",
             "document.getElementById('btnAddFile').onclick = function() {",
-            "    vscode.postMessage({ type: 'requestFileAccess', target: '__dialog__' });",
+            "    vscode.postMessage({ type: 'requestFileAccess', target: 'picker' });",
+            "};",
+            "document.getElementById('btnRelatedFiles').onclick = function() {",
+            "    vscode.postMessage({ type: 'addRelatedFiles' });",
+            "};",
+            "document.getElementById('btnThink').onclick = function() {",
+            "    vscode.postMessage({ type: 'toggleThinkMode' });",
+            "};",
+            "document.getElementById('btnCloud').onclick = function() {",
+            "    vscode.postMessage({ type: 'openCloudConnect' });",
+            "};",
+            "document.getElementById('btnClearHistory').onclick = function() {",
+            "    if (confirm('Effacer l\\'historique ?')) {",
+            "        vscode.postMessage({ type: 'clearHistory' });",
+            "        chat.innerHTML = '';",
+            "    }",
+            "};",
+            "document.getElementById('btnGitReview').onclick = function() {",
+            "    vscode.postMessage({ type: 'reviewDiff' });",
+            "};",
+            "document.getElementById('btnCommit').onclick = function() {",
+            "    vscode.postMessage({ type: 'generateCommitMessage' });",
+            "};",
+            "document.getElementById('btnTests').onclick = function() {",
+            "    vscode.postMessage({ type: 'generateTests' });",
+            "};",
+            "document.getElementById('btnError').onclick = function() {",
+            "    var err = prompt.value.trim();",
+            "    if (!err) {",
+            "        var inp = window.prompt('Coller votre erreur / stack trace :');",
+            "        if (!inp) return;",
+            "        err = inp;",
+            "    }",
+            "    vscode.postMessage({ type: 'analyzeError', value: err });",
+            "    prompt.value = '';",
             "};",
             "",
+            "// ─── Model select ───",
             "function updateSelectColor() {",
             "    var opt = modelSelect.options[modelSelect.selectedIndex];",
+            "    if (!opt) return;",
+            "    var isLocal = !opt.getAttribute('data-url') || opt.getAttribute('data-url') === 'http://localhost:11434';",
+            "    modelSelect.style.color = isLocal ? '#b19cd9' : '#00d2ff';",
             "    var warn = document.getElementById('localWarn');",
-            "    if (!opt || !opt.value) {",
-            "        modelSelect.className = 'offline';",
-            "        warn.className = 'offline';",
-            "        warn.innerHTML = '&#x26A0;&#xFE0F; Ollama hors ligne &mdash; Lancez Ollama ou connectez un compte Cloud';",
+            "    if (!opt.value) {",
+            "        warn.className = 'offline'; warn.innerHTML = '⚠️ Ollama hors ligne'; warn.style.display = 'block';",
+            "    } else if (isLocal) {",
+            "        warn.className = 'local'; warn.innerHTML = '⚡ <b>Mode Local</b> &mdash; ' + (opt.getAttribute('data-name') || '');",
             "        warn.style.display = 'block';",
-            "        return;",
-            "    }",
-            "    modelSelect.className = '';",
-            "    modelSelect.style.color = opt.style.color;",
-            "    modelSelect.style.borderColor = opt.style.color;",
-            "    var u = opt.getAttribute('data-url') || '';",
-            "    var isLocal = u === '' || u.indexOf('localhost') !== -1 || u.indexOf('127.0.0.1') !== -1;",
-            "    if (isLocal) {",
-            "        warn.className = 'local';",
-            "        warn.innerHTML = '&#x26A1; <b>Mode Local</b> &mdash; D&eacute;conseill&eacute; pour les gros fichiers';",
             "    } else {",
-            "        warn.className = 'cloud';",
-            "        warn.innerHTML = '&#x2601;&#xFE0F; <b>Mode Cloud</b> &mdash; ' + (opt.getAttribute('data-name') || '');",
+            "        warn.className = 'cloud'; warn.innerHTML = '☁️ <b>Mode Cloud</b> &mdash; ' + (opt.getAttribute('data-name') || '');",
+            "        warn.style.display = 'block';",
             "    }",
-            "    warn.style.display = 'block';",
+            "    vscode.postMessage({ type: 'getTokenBudget' });",
             "}",
             "modelSelect.onchange = function() {",
             "    updateSelectColor();",
-            "    // Save full value (includes url||name for cloud models)",
             "    vscode.postMessage({ type: 'saveModel', model: modelSelect.value });",
             "};",
             "",
+            "// ─── Message handler ───",
             "window.addEventListener('message', function(e) {",
             "    var m = e.data;",
             "    if (m.type === 'setModels') {",
@@ -720,7 +1391,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "                var sel = x.value === m.selected ? 'selected' : '';",
             "                return '<option value=\"'+x.value+'\" data-name=\"'+x.name+'\" data-url=\"'+x.url+'\" style=\"color:'+color+'\" '+sel+'>'+x.label+'</option>';",
             "              }).join('')",
-            "            : '<option value=\"\" data-name=\"\" data-url=\"\" style=\"color:#ff6b6b\">\u26A0\uFE0F Ollama hors ligne</option>';",
+            "            : '<option value=\"\" data-name=\"\" data-url=\"\" style=\"color:#ff6b6b\">⚠️ Ollama hors ligne</option>';",
             "        updateSelectColor();",
             "    }",
             "    if (m.type === 'startResponse') {",
@@ -735,7 +1406,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "        if (!currentAiMsg) { currentAiMsg = addMsg('', 'ai', true); }",
             "        currentAiText += m.value;",
             "        currentAiMsg.innerHTML = renderMarkdown(currentAiText);",
-            "        chat.scrollTop = chat.scrollHeight;",
+            "        smartScroll();",
             "    }",
             "    if (m.type === 'endResponse') {",
             "        var finalText = m.value || currentAiText;",
@@ -750,10 +1421,59 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "            addMsg(msg.role === 'ai' ? renderMarkdown(msg.value) : msg.value, msg.role, msg.role === 'ai');",
             "        });",
             "    }",
+            "    if (m.type === 'statusMessage') { addStatusMsg(m.value); }",
+            "    if (m.type === 'thinkModeChanged') {",
+            "        thinkModeActive = m.active;",
+            "        var btn = document.getElementById('btnThink');",
+            "        btn.style.background = m.active ? 'rgba(160,0,255,0.25)' : '';",
+            "        btn.style.borderColor = m.active ? '#a000ff' : '';",
+            "        btn.style.color = m.active ? '#cc88ff' : '';",
+            "        btn.title = m.active ? 'Mode Réflexion ACTIF (cliquer pour désactiver)' : 'Activer le Mode Réflexion';",
+            "    }",
+            "    if (m.type === 'tokenBudget') { updateTokenBar(m.used, m.max, m.isCloud); }",
+            "    if (m.type === 'patchSummary') {",
+            "        var ps = document.createElement('div');",
+            "        ps.className = 'patch-summary';",
+            "        ps.innerHTML = '✅ ' + renderMarkdown(m.summary);",
+            "        chat.appendChild(ps);",
+            "        smartScroll();",
+            "    }",
+            "    if (m.type === 'terminalCommand') {",
+            "        terminalLog.style.display = 'block';",
+            "        var line = document.createElement('div');",
+            "        line.className = 'cmd-line';",
+            "        var badge = m.status === 'refused' ? 'refused' : (m.status === 'auto' ? 'auto' : 'accepted');",
+            "        var label = m.status === 'refused' ? 'refusé' : (m.status === 'auto' ? 'auto' : 'ok');",
+            "        line.innerHTML = '<span class=\"cmd-badge '+badge+'\">'+label+'</span><span class=\"cmd-text\">$ '+escapeHtml(m.cmd)+'</span>';",
+            "        terminalLog.appendChild(line);",
+            "        terminalLog.scrollTop = terminalLog.scrollHeight;",
+            "        if (terminalLog.children.length > 20) terminalLog.removeChild(terminalLog.firstChild);",
+            "    }",
+            "    if (m.type === 'setTerminalPermission') {",
+            "        termPermSelect.value = m.value || 'ask-all';",
+            "    }",
+            "    if (m.type === 'showPlan') {",
+            "        var planEl = document.createElement('div');",
+            "        planEl.className = 'msg plan-msg';",
+            "        planEl.innerHTML = '<b>🧠 Plan de l\\'IA :</b><br>' + escapeHtml(m.plan).replace(/\\n/g,'<br>');",
+            "        chat.appendChild(planEl);",
+            "        chat.scrollTop = chat.scrollHeight;",
+            "    }",
+            "    if (m.type === 'updateContextFiles') {",
+            "        // Sync context files from backend (e.g. auto-detected related files)",
+            "        m.files.forEach(function(f) {",
+            "            if (!contextFiles.find(function(cf) { return cf.name === f.name; })) {",
+            "                contextFiles.push({ name: f.name, content: '...', tokens: f.tokens });",
+            "            }",
+            "        });",
+            "        renderFilesBar();",
+            "    }",
             "});",
             "",
             "vscode.postMessage({ type: 'getModels' });",
-            "vscode.postMessage({ type: 'restoreHistory' });"
+            "vscode.postMessage({ type: 'restoreHistory' });",
+            "vscode.postMessage({ type: 'getTokenBudget' });",
+            "vscode.postMessage({ type: 'getTerminalPermission' });"
         ].join("\n");
 
         return `<!DOCTYPE html>
@@ -772,22 +1492,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .btn-cloud { background: none; border: 1px solid #00d2ff; color: #00d2ff; padding: 4px 10px; font-size: 11px; border-radius: 20px; cursor: pointer; font-weight: 700; transition: all 0.2s; }
         .btn-cloud:hover { background: rgba(0,210,255,0.15); }
         select#modelSelect { max-width: 150px; padding: 4px 6px; border-radius: 20px; background: #0a0a1a; border: 1px solid #444; outline: none; font-size: 11px; color: #00d2ff; cursor: pointer; }
-        select#modelSelect.offline { color: #ff6b6b !important; border-color: #ff6b6b !important; animation: blink-border 1.5s infinite; }
-        @keyframes blink-border { 0%,100%{opacity:1} 50%{opacity:0.4} }
         #localWarn { display: none; padding: 4px 12px; font-size: 11px; text-align: center; border-bottom: 1px solid; flex-shrink: 0; }
         #localWarn.local { background: rgba(177,156,217,0.12); color: #c9a9f5; border-color: rgba(177,156,217,0.25); }
         #localWarn.cloud { background: rgba(0,210,255,0.08); color: #00d2ff; border-color: rgba(0,210,255,0.2); }
         #localWarn.offline { background: rgba(255,80,80,0.1); color: #ff6b6b; border-color: rgba(255,80,80,0.25); }
+        #tokenBar { display: none; padding: 3px 12px; background: rgba(0,0,0,0.4); border-bottom: 1px solid rgba(255,255,255,0.06); flex-shrink: 0; }
         #filesBar { display: none; background: rgba(0,122,204,0.1); padding: 5px 12px; font-size: 11px; color: #aaa; border-bottom: 1px solid rgba(0,122,204,0.2); flex-direction: row; gap: 6px; align-items: center; overflow-x: auto; white-space: nowrap; flex-shrink: 0; }
-        #filesBar .file-tag { background: rgba(0,122,204,0.25); color: #6cb6ff; border: 1px solid rgba(0,122,204,0.4); padding: 2px 8px; border-radius: 10px; cursor: pointer; font-size: 11px; }
-        #filesBar .file-tag:hover { background: rgba(0,122,204,0.4); }
+        #filesBar .file-tag { background: rgba(0,122,204,0.25); color: #6cb6ff; border: 1px solid rgba(0,122,204,0.4); padding: 2px 8px; border-radius: 10px; cursor: pointer; font-size: 11px; transition: background 0.2s; }
+        #filesBar .file-tag:hover { background: rgba(0,122,204,0.5); }
         #chat { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 12px; }
         #chat::-webkit-scrollbar { width: 4px; } #chat::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
         .msg { padding: 10px 14px; border-radius: 12px; max-width: 95%; line-height: 1.6; word-break: break-word; }
         .user { background: rgba(0,80,200,0.35); align-self: flex-end; border: 1px solid rgba(0,120,255,0.3); border-bottom-right-radius: 2px; white-space: pre-wrap; }
         .ai { background: rgba(15,15,30,0.9); align-self: flex-start; width: 100%; border: 1px solid rgba(255,255,255,0.07); border-bottom-left-radius: 2px; }
+        .ai p { margin: 6px 0; }
         .ai b { color: #fff; }
         .ai code { background: #1a1a2e; color: #00d2ff; padding: 2px 5px; border-radius: 4px; font-family: 'Fira Code', monospace; font-size: 11px; }
+        .plan-msg { background: rgba(120,0,255,0.12); border: 1px solid rgba(160,0,255,0.3); border-radius: 10px; padding: 10px 14px; align-self: flex-start; width: 100%; font-size: 12px; color: #cc88ff; }
+        .status-msg { align-self: center; font-size: 11px; color: #888; padding: 4px 12px; background: rgba(255,255,255,0.05); border-radius: 20px; border: 1px solid #333; }
         .code-block { background: #0d0d1a; border: 1px solid #2a2a3a; border-radius: 8px; margin: 10px 0; overflow: hidden; }
         .code-header { background: #141424; padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: #888; border-bottom: 1px solid #2a2a3a; gap: 6px; }
         .code-header span { flex: 1; }
@@ -802,14 +1524,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         #prompt:focus { border-color: rgba(0,210,255,0.5); }
         #send { background: #007acc; color: #fff; border: none; padding: 10px 18px; border-radius: 22px; cursor: pointer; font-weight: 700; font-size: 13px; white-space: nowrap; transition: background 0.2s; }
         #send:hover { background: #0090e0; }
-        .input-actions { display: flex; gap: 6px; }
-        .btn-action { background: rgba(255,255,255,0.06); color: #aaa; border: 1px solid #333; padding: 4px 10px; border-radius: 12px; cursor: pointer; font-size: 11px; transition: all 0.2s; }
+        .input-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+        .btn-action { background: rgba(255,255,255,0.06); color: #aaa; border: 1px solid #333; padding: 4px 10px; border-radius: 12px; cursor: pointer; font-size: 11px; transition: all 0.2s; white-space: nowrap; }
         .btn-action:hover { background: rgba(255,255,255,0.12); color: #fff; }
         .thinking { display: flex; gap: 4px; align-items: center; padding: 6px 0; }
         .thinking span { width: 6px; height: 6px; background: #00d2ff; border-radius: 50%; animation: bounce 1.2s infinite; }
         .thinking span:nth-child(2) { animation-delay: 0.2s; } .thinking span:nth-child(3) { animation-delay: 0.4s; }
         @keyframes bounce { 0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-8px)} }
         button { font-family: 'Inter', sans-serif; }
+        /* ── Patch summary ── */
+        .patch-summary { align-self: flex-start; width: 100%; background: rgba(0,200,100,0.08); border: 1px solid rgba(0,200,100,0.25); border-radius: 10px; padding: 8px 14px; font-size: 11px; color: #6debb0; margin-top: 2px; }
+        .patch-summary b { color: #a0ffcc; }
+        /* ── Terminal log ── */
+        #terminalLog { display: none; background: rgba(0,0,0,0.5); border-top: 1px solid rgba(0,210,255,0.1); padding: 4px 12px; font-family: 'Fira Code', monospace; font-size: 11px; color: #888; max-height: 80px; overflow-y: auto; flex-shrink: 0; }
+        #terminalLog .cmd-line { display: flex; gap: 6px; align-items: center; padding: 2px 0; }
+        #terminalLog .cmd-line .cmd-badge { font-size: 10px; padding: 1px 6px; border-radius: 8px; flex-shrink: 0; }
+        #terminalLog .cmd-line .cmd-badge.accepted { background: rgba(0,200,100,0.2); color: #6debb0; border: 1px solid rgba(0,200,100,0.3); }
+        #terminalLog .cmd-line .cmd-badge.refused { background: rgba(255,80,80,0.15); color: #ff8888; border: 1px solid rgba(255,80,80,0.3); }
+        #terminalLog .cmd-line .cmd-badge.auto { background: rgba(0,210,255,0.15); color: #00d2ff; border: 1px solid rgba(0,210,255,0.25); }
+        #terminalLog .cmd-text { color: #ccc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        /* ── Terminal permission select ── */
+        #termPermSelect { background: rgba(20,20,40,0.8); color: #aaa; border: 1px solid #333; border-radius: 12px; padding: 3px 8px; font-size: 10px; cursor: pointer; outline: none; font-family: 'Inter', sans-serif; }
+        /* ── Scroll-to-bottom FAB ── */
+        #scrollBtn { display: none; position: absolute; bottom: 14px; right: 14px; width: 32px; height: 32px; border-radius: 50%; background: rgba(0,210,255,0.2); border: 1px solid rgba(0,210,255,0.4); color: #00d2ff; font-size: 16px; cursor: pointer; align-items: center; justify-content: center; transition: all 0.2s; z-index: 10; }
+        #scrollBtn:hover { background: rgba(0,210,255,0.35); }
+        #chatWrap { flex: 1; position: relative; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
     </style>
 </head>
 <body>
@@ -817,20 +1556,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div class="header">
         <span class="header-brand">ANTIGRAVITY</span>
         <div class="header-controls">
-            <button class="btn-cloud" id="btnCloud">&#x2601;&#xFE0F; Cloud</button>
+            <button class="btn-cloud" id="btnCloud">☁️ Cloud</button>
             <select id="modelSelect"></select>
         </div>
     </div>
     <div id="localWarn"></div>
+    <div id="tokenBar"></div>
     <div id="filesBar"></div>
-    <div id="chat"></div>
+    <div id="chatWrap">
+        <div id="chat"></div>
+        <button id="scrollBtn" title="Retour en bas">↓</button>
+    </div>
+    <div id="terminalLog"></div>
     <div class="input-area">
         <div class="input-actions">
-            <button class="btn-action" id="btnAddFile">&#x1F4CE; Contexte fichier</button>
-            <button class="btn-action" id="btnClearHistory">&#x1F5D1; Effacer</button>
+            <button class="btn-action" id="btnAddFile" title="Ajouter un fichier au contexte">📎 Fichier</button>
+            <button class="btn-action" id="btnRelatedFiles" title="Ajouter les fichiers importés du fichier actif">🔗 Liés</button>
+            <button class="btn-action" id="btnThink" title="Mode Réflexion : l'IA planifie avant d'agir">🧠 Réflexion</button>
+            <button class="btn-action" id="btnError" title="Analyser une erreur avec détection auto de fichier">🐛 Erreur</button>
+            <button class="btn-action" id="btnGitReview" title="Revue du diff Git actuel">📝 Diff</button>
+            <button class="btn-action" id="btnCommit" title="Générer un message de commit">💾 Commit</button>
+            <button class="btn-action" id="btnTests" title="Générer les tests du fichier actif">🧪 Tests</button>
+            <button class="btn-action" id="btnClearHistory" title="Effacer l'historique">🗑 Vider</button>
+            <select id="termPermSelect" title="Permissions terminal IA">
+                <option value="ask-all">💻 Demander toujours</option>
+                <option value="ask-important">⚠️ Demander si important</option>
+                <option value="allow-all">🚀 Autoriser tout</option>
+            </select>
         </div>
         <div class="input-row">
-            <textarea id="prompt" placeholder="Posez une question\u2026 (Entr\u00E9e pour envoyer)" rows="1"></textarea>
+            <textarea id="prompt" placeholder="Posez une question… (Entrée pour envoyer, Shift+Entrée pour saut de ligne)" rows="1"></textarea>
             <button id="send">SEND</button>
         </div>
     </div>
