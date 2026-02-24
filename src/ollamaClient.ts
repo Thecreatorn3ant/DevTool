@@ -1,5 +1,12 @@
 import * as vscode from 'vscode';
 
+export interface ApiKeyEntry {
+    key: string;
+    label: string;
+    platform?: string;
+    rateLimitedUntil?: number;
+}
+
 export class OllamaClient {
 
     private _getConfig() {
@@ -10,64 +17,104 @@ export class OllamaClient {
         return this._getConfig().get<string>('ollamaUrl') || 'http://localhost:11434';
     }
 
+    private _getApiKeys(): ApiKeyEntry[] {
+        return this._getConfig().get<ApiKeyEntry[]>('apiKeys') || [];
+    }
+
+    private async _saveApiKeys(keys: ApiKeyEntry[]) {
+        await this._getConfig().update('apiKeys', keys, true);
+    }
+
+    private _getAvailableKey(platform: string): string {
+        const config = this._getConfig();
+        const mainKey = config.get<string>('apiKey') || '';
+        const allKeys = this._getApiKeys();
+        const now = Date.now();
+
+        const best = allKeys.find(k => k.key && (!k.platform || platform.includes(k.platform)) && (!k.rateLimitedUntil || k.rateLimitedUntil < now));
+        if (best) return best.key;
+
+        return mainKey;
+    }
+
+    private async _markKeyAsRateLimited(key: string) {
+        const allKeys = this._getApiKeys();
+        const now = Date.now();
+        let changed = false;
+        const updated = allKeys.map(k => {
+            if (k.key === key) {
+                changed = true;
+                return { ...k, rateLimitedUntil: now + 60000 };
+            }
+            return k;
+        });
+        if (changed) {
+            await this._saveApiKeys(updated);
+        }
+    }
+
     async generateStreamingResponse(
         prompt: string,
         context: string,
         onUpdate: (chunk: string) => void,
-        modelOverride?: string
+        modelOverride?: string,
+        targetUrl?: string
     ): Promise<string> {
+        const url = targetUrl || this._getBaseUrl();
         const config = this._getConfig();
-        const url = this._getBaseUrl();
         const model = modelOverride || config.get<string>('defaultModel') || 'llama3';
-
-        const systemPrompt = `Tu es une IA de programmation locale intégrée dans VS Code (extension Antigravity).
-Tu as accès à l'arborescence complète du projet et au contenu des fichiers ouverts.
-
-━━━ RÈGLES DE MODIFICATION DE FICHIER EXISTANT ━━━
-Tu DOIS utiliser UNIQUEMENT des blocs SEARCH/REPLACE chirurgicaux entourés de backticks.
-Ne réécris JAMAIS le fichier entier sauf si on te le demande explicitement.
-
-Format OBLIGATOIRE (respecte exactement les marqueurs) :
-\`\`\`python
-<<<< SEARCH
-code exact à remplacer (2-5 lignes pour être unique)
-====
-code mis à jour
->>>>
-\`\`\`
-
-Règles SEARCH/REPLACE :
-- Chaque bloc SEARCH doit être UNIQUE dans le fichier (ajoute des lignes de contexte si nécessaire)
-- Ne modifie QUE les lignes concernées, laisse le reste intact
-- L'indentation doit être identique à l'originale
-- Tu peux enchaîner plusieurs blocs SEARCH/REPLACE dans un même bloc de code
-
-━━━ CRÉATION DE NOUVEAU FICHIER ━━━
-Utilise [FILE: chemin/du/fichier.ext] suivi d'un bloc de code standard (sans SEARCH/REPLACE).
-
-━━━ COMMANDES TERMINAL ━━━
-[RUN: commande] pour suggérer une exécution dans le terminal.
-
-━━━ LIENS FICHIERS ━━━
-[FILE: chemin] pour mentionner un fichier existant (cliquable dans l'interface).
-
-Sois bref, technique et scrupuleux sur l'indentation.`;
 
         const fullPrompt = context
             ? `Contexte du projet:\n${context}\n\n---\nQuestion: ${prompt}`
             : prompt;
 
+        return await this._doRequestWithRetry(url, model, fullPrompt, onUpdate);
+    }
+
+    private async _doRequestWithRetry(url: string, model: string, fullPrompt: string, onUpdate: (chunk: string) => void, attempt: number = 0): Promise<string> {
+        const apiKey = this._getAvailableKey(url);
+        const isOpenAI = this._isOpenAI(url);
+        const systemPrompt = this._getSystemPrompt();
+
         try {
-            const response = await fetch(`${url}/api/generate`, {
+            const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+            if (apiKey) {
+                headers['Authorization'] = `Bearer ${apiKey}`;
+            }
+            if (url.includes('openrouter')) {
+                headers['HTTP-Referer'] = 'https://github.com/microsoft/vscode';
+                headers['X-Title'] = 'VSCode Antigravity';
+            }
+
+            const endpoint = isOpenAI ? `${url}/chat/completions` : `${url}/api/generate`;
+
+            const reqBody = isOpenAI ? {
+                model,
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: fullPrompt }
+                ],
+                stream: true
+            } : {
+                model,
+                prompt: fullPrompt,
+                system: systemPrompt,
+                stream: true
+            };
+
+            const response = await fetch(endpoint, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    model,
-                    prompt: fullPrompt,
-                    system: systemPrompt,
-                    stream: true
-                }),
+                headers,
+                body: JSON.stringify(reqBody),
             });
+
+            if (response.status === 429 && attempt < 3) {
+                if (apiKey) {
+                    await this._markKeyAsRateLimited(apiKey);
+                    vscode.window.showWarningMessage("⏳ Rate Limit atteint sur ce compte. Basculement sur un autre disponible...");
+                    return this._doRequestWithRetry(url, model, fullPrompt, onUpdate, attempt + 1);
+                }
+            }
 
             if (!response.ok) {
                 const errorText = await response.text();
@@ -75,9 +122,7 @@ Sois bref, technique et scrupuleux sur l'indentation.`;
             }
 
             const reader = response.body?.getReader();
-            if (!reader) {
-                throw new Error("Impossible de lire le flux de réponse.");
-            }
+            if (!reader) throw new Error("Impossible de lire le flux de réponse.");
 
             const decoder = new TextDecoder();
             let fullResponse = '';
@@ -92,32 +137,51 @@ Sois bref, technique et scrupuleux sur l'indentation.`;
                 buffer = lines.pop() ?? '';
 
                 for (const line of lines) {
-                    if (!line.trim()) { continue; }
-                    try {
-                        const data = JSON.parse(line);
-                        if (data.response) {
-                            fullResponse += data.response;
-                            onUpdate(data.response);
+                    const cleanLine = line.trim();
+                    if (!cleanLine) continue;
+
+                    if (isOpenAI) {
+                        if (cleanLine === 'data: [DONE]') continue;
+                        if (cleanLine.startsWith('data: ')) {
+                            try {
+                                const data = JSON.parse(cleanLine.slice(6));
+                                const content = data.choices?.[0]?.delta?.content;
+                                if (content) {
+                                    fullResponse += content;
+                                    onUpdate(content);
+                                }
+                            } catch (e) { /* ignore parse error */ }
                         }
-                        if (data.error) {
-                            throw new Error(data.error);
-                        }
-                    } catch (e: any) {
-                        if (e.message && !e.message.includes('JSON')) {
-                            throw e;
+                    } else {
+                        try {
+                            const data = JSON.parse(cleanLine);
+                            if (data.response) {
+                                fullResponse += data.response;
+                                onUpdate(data.response);
+                            }
+                            if (data.error) throw new Error(data.error);
+                        } catch (e: any) {
+                            if (e.message && !e.message.includes('JSON')) throw e;
                         }
                     }
                 }
             }
 
             if (buffer.trim()) {
-                try {
-                    const data = JSON.parse(buffer);
-                    if (data.response) {
-                        fullResponse += data.response;
-                        onUpdate(data.response);
+                if (isOpenAI) {
+                    if (buffer.startsWith('data: ') && buffer !== 'data: [DONE]') {
+                        try {
+                            const data = JSON.parse(buffer.slice(6));
+                            const content = data.choices?.[0]?.delta?.content;
+                            if (content) { fullResponse += content; onUpdate(content); }
+                        } catch { }
                     }
-                } catch { /* ignore */ }
+                } else {
+                    try {
+                        const data = JSON.parse(buffer);
+                        if (data.response) { fullResponse += data.response; onUpdate(data.response); }
+                    } catch { }
+                }
             }
 
             return fullResponse;
@@ -125,44 +189,115 @@ Sois bref, technique et scrupuleux sur l'indentation.`;
         } catch (error: any) {
             const msg = error.message || String(error);
             if (msg.includes('fetch') || msg.includes('ECONNREFUSED') || msg.includes('NetworkError')) {
-                vscode.window.showErrorMessage(`Ollama inaccessible. Vérifiez qu'Ollama est bien lancé sur ${url}`);
+                vscode.window.showErrorMessage(`Serveur inaccessible sur ${url}`);
             } else {
-                vscode.window.showErrorMessage(`Erreur Ollama: ${msg}`);
+                vscode.window.showErrorMessage(`Erreur IA: ${msg}`);
             }
             return '';
         }
     }
 
-    async generateResponse(prompt: string, context: string = '', modelOverride?: string): Promise<string> {
+    private _getSystemPrompt(): string {
+        return `Tu es une IA d'édition de code intégrée dans VS Code. Ton seul but est d'éditer le code de l'utilisateur.
+
+━━━ COMPORTEMENT STRICT ABSOLU (SINON ÉCHEC) ━━━
+- RÉPONDRE EXCLUSIVEMENT EN FRANÇAIS.
+- Modifie UNIQUEMENT le vrai code fourni dans le contexte (la section [FICHIER ACTIF]).
+- Style robotique : PAS de salutations, PAS d'explications. Fournis directement le correctif.
+
+━━━ FORMAT OBLIGATOIRE POUR MODIFIER UN FICHIER ━━━
+Toujours utiliser les blocs SEARCH/REPLACE. 
+
+\`\`\`typescript
+<<<< SEARCH
+code_exact_existant
+====
+nouveau_code
+>>>>
+\`\`\`
+
+Règles :
+1. SEARCH doit être un copié-collé STRICT.
+2. Inclure 2 lignes de contexte avant et après.`;
+    }
+
+    async generateResponse(prompt: string, context: string = '', modelOverride?: string, targetUrl?: string): Promise<string> {
         let full = '';
-        return await this.generateStreamingResponse(prompt, context, (c) => { full += c; }, modelOverride);
+        return await this.generateStreamingResponse(prompt, context, (c) => { full += c; }, modelOverride, targetUrl);
+    }
+
+    private _isOpenAI(url: string): boolean {
+        return url.includes('together') || url.includes('openrouter') || url.endsWith('/v1');
     }
 
     async listModels(): Promise<string[]> {
+        const url = this._getBaseUrl();
+        const apiKey = this._getAvailableKey(url);
+        const headers: Record<string, string> = {};
+        if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
         try {
-            const url = this._getBaseUrl();
-            const response = await fetch(`${url}/api/tags`, {
-                signal: AbortSignal.timeout(5000)
-            });
-            if (!response.ok) { return []; }
+            const isOpenAI = this._isOpenAI(url);
+            const endpoint = isOpenAI ? `${url}/models` : `${url}/api/tags`;
+            const response = await fetch(endpoint, { headers, signal: AbortSignal.timeout(5000) });
+            if (!response.ok) return [];
             const data: any = await response.json();
-            if (!Array.isArray(data?.models)) { return []; }
-            return data.models.map((m: any) => m.name as string).filter(Boolean);
-        } catch (error) {
-            console.error('Failed to list models:', error);
-            return [];
+            if (isOpenAI) {
+                return (data?.data || []).map((m: any) => m.id).filter(Boolean);
+            } else {
+                return (data?.models || []).map((m: any) => m.name).filter(Boolean);
+            }
+        } catch { return []; }
+    }
+
+    async listAllModels(): Promise<{ name: string, isLocal: boolean, url: string }[]> {
+        const activeUrl = this._getBaseUrl();
+        const config = this._getConfig();
+        const result: { name: string, isLocal: boolean, url: string }[] = [];
+
+        let localModels: string[] = [];
+        try {
+            const res = await fetch('http://localhost:11434/api/tags', { signal: AbortSignal.timeout(2000) });
+            if (res.ok) {
+                const data: any = await res.json();
+                localModels = (data?.models || []).map((m: any) => m.name).filter(Boolean);
+            }
+        } catch { }
+
+        let cloudModels: string[] = [];
+        if (!activeUrl.includes('localhost') && !activeUrl.includes('127.0.0.1')) {
+            try {
+                const apiKey = this._getAvailableKey(activeUrl);
+                const headers: Record<string, string> = {};
+                if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+                const isOpenAI = this._isOpenAI(activeUrl);
+                const endpoint = isOpenAI ? `${activeUrl}/models` : `${activeUrl}/api/tags`;
+                const res = await fetch(endpoint, { headers, signal: AbortSignal.timeout(4000) });
+                if (res.ok) {
+                    const data: any = await res.json();
+                    cloudModels = isOpenAI
+                        ? (data?.data || []).map((m: any) => m.id).filter(Boolean)
+                        : (data?.models || []).map((m: any) => m.name).filter(Boolean);
+                }
+            } catch { }
         }
+
+        for (const m of cloudModels) result.push({ name: m, isLocal: false, url: activeUrl });
+        for (const m of localModels) result.push({ name: m, isLocal: true, url: 'http://localhost:11434' });
+
+        return result;
     }
 
     async checkConnection(): Promise<boolean> {
+        const url = this._getBaseUrl();
+        const apiKey = this._getAvailableKey(url);
+        const headers: Record<string, string> = {};
+        if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
         try {
-            const url = this._getBaseUrl();
-            const response = await fetch(`${url}/api/tags`, {
-                signal: AbortSignal.timeout(3000)
-            });
+            const isOpenAI = this._isOpenAI(url);
+            const endpoint = isOpenAI ? `${url}/models` : `${url}/api/tags`;
+            const response = await fetch(endpoint, { headers, signal: AbortSignal.timeout(3000) });
             return response.ok;
-        } catch {
-            return false;
-        }
+        } catch { return false; }
     }
 }
