@@ -19,6 +19,12 @@
                 "command": "local-ai.openChat",
                 "title": "Local AI: Open Chat",
                 "category": "Local AI"
+            },
+            {
+                "command": "local-ai.generateCommitMessage",
+                "title": "✨ Générer un message de commit (IA)",
+                "category": "Local AI",
+                "icon": "$(sparkle)"
             }
         ],
         "viewsContainers": {
@@ -81,6 +87,21 @@
                     }
                 }
             }
+        },
+        "menus": {
+            "scm/inputBox": [
+                {
+                    "command": "local-ai.generateCommitMessage",
+                    "when": "scmProvider == git"
+                }
+            ],
+            "scm/title": [
+                {
+                    "command": "local-ai.generateCommitMessage",
+                    "when": "scmProvider == git",
+                    "group": "navigation"
+                }
+            ]
         }
     },
     "scripts": {
