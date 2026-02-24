@@ -257,31 +257,46 @@ export class OllamaClient {
     ): Promise<string> {
         const { key: apiKey, entry: keyEntry } = this._getAvailableKey(url);
         const isOpenAI = this._isOpenAI(url);
+        const isGemini = this._isGemini(url);
         const systemPrompt = this._getSystemPrompt();
 
         try {
             const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-            if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+            if (apiKey && !isGemini) headers['Authorization'] = `Bearer ${apiKey}`;
+
             if (url.includes('openrouter')) {
                 headers['HTTP-Referer'] = 'https://github.com/microsoft/vscode';
                 headers['X-Title'] = 'VSCode Antigravity';
             }
 
-            const endpoint = isOpenAI ? `${url}/chat/completions` : `${url}/api/generate`;
+            let endpoint = isOpenAI ? `${url}/chat/completions` : `${url}/api/generate`;
+            let reqBody: any;
 
-            const reqBody = isOpenAI ? {
-                model,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: fullPrompt }
-                ],
-                stream: true
-            } : {
-                model,
-                prompt: fullPrompt,
-                system: systemPrompt,
-                stream: true
-            };
+            if (isGemini) {
+                endpoint = `${url}/models/${model}:streamGenerateContent?key=${apiKey}`;
+                reqBody = {
+                    contents: [{
+                        role: 'user',
+                        parts: [{ text: systemPrompt + "\n\n" + fullPrompt }]
+                    }]
+                };
+            } else if (isOpenAI) {
+                reqBody = {
+                    model,
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: fullPrompt }
+                    ],
+                    stream: true
+                };
+            } else {
+                reqBody = {
+                    model,
+                    prompt: fullPrompt,
+                    system: systemPrompt,
+                    stream: true
+                };
+            }
 
             const response = await fetch(endpoint, {
                 method: 'POST',
@@ -324,10 +339,18 @@ export class OllamaClient {
                 buffer = lines.pop() ?? '';
 
                 for (const line of lines) {
-                    const cleanLine = line.trim();
+                    let cleanLine = line.trim();
                     if (!cleanLine) continue;
 
-                    if (isOpenAI) {
+                    if (isGemini) {
+                        if (cleanLine.startsWith(',')) cleanLine = cleanLine.slice(1).trim();
+                        if (cleanLine.startsWith('[') || cleanLine.startsWith(']')) continue;
+                        try {
+                            const data = JSON.parse(cleanLine);
+                            const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                            if (content) { fullResponse += content; onUpdate(content); }
+                        } catch { }
+                    } else if (isOpenAI) {
                         if (cleanLine === 'data: [DONE]') continue;
                         if (cleanLine.startsWith('data: ')) {
                             try {
@@ -416,6 +439,10 @@ Règles :
 
     private _isOpenAI(url: string): boolean {
         return url.includes('together') || url.includes('openrouter') || url.endsWith('/v1');
+    }
+
+    private _isGemini(url: string): boolean {
+        return url.includes('generativelanguage.googleapis.com');
     }
 
     async listModels(): Promise<string[]> {
