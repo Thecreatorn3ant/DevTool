@@ -89,12 +89,6 @@
             }
         },
         "menus": {
-            "scm/inputBox": [
-                {
-                    "command": "local-ai.generateCommitMessage",
-                    "when": "scmProvider == git"
-                }
-            ],
             "scm/title": [
                 {
                     "command": "local-ai.generateCommitMessage",
