@@ -6,7 +6,7 @@
     "publisher": "antigravity",
     "icon": "media/icon.png",
     "engines": {
-        "vscode": "^1.109.0"
+        "vscode": "1.109.5"
     },
     "categories": [
         "AI",
