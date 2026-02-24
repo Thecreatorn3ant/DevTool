@@ -620,57 +620,75 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private async _handleAddKey() {
         const name = await vscode.window.showInputBox({
-            title: 'Ajouter une clé API — 1/3',
+            title: 'Ajouter un provider — 1/3',
             prompt: 'Nom du provider',
-            placeHolder: 'ex: OpenAI perso, OpenRouter compte 2, Mistral…',
+            placeHolder: 'ex: OpenAI perso, Ollama VPS, OpenRouter #2…',
             ignoreFocusOut: true,
         });
         if (!name) return;
 
-        const PRESET_URLS = [
-            { label: 'OpenAI', description: 'https://api.openai.com/v1' },
-            { label: 'OpenRouter', description: 'https://openrouter.ai/api/v1' },
-            { label: 'Together AI', description: 'https://api.together.xyz/v1' },
-            { label: 'Mistral', description: 'https://api.mistral.ai/v1' },
-            { label: 'Groq', description: 'https://api.groq.com/openai/v1' },
-            { label: 'Autre / Personnalisé…', description: '' },
+        interface UrlPreset extends vscode.QuickPickItem {
+            description: string;
+            needsKey: boolean;
+        }
+        const PRESET_URLS: UrlPreset[] = [
+            {
+                label: '⚡ Ollama distant (sans clé)', description: '', needsKey: false,
+                detail: 'Serveur Ollama auto-hébergé ou cloud — clé non requise'
+            },
+            { label: 'OpenAI', description: 'https://api.openai.com/v1', needsKey: true },
+            { label: 'OpenRouter', description: 'https://openrouter.ai/api/v1', needsKey: true },
+            { label: 'Together AI', description: 'https://api.together.xyz/v1', needsKey: true },
+            { label: 'Mistral', description: 'https://api.mistral.ai/v1', needsKey: true },
+            { label: 'Groq', description: 'https://api.groq.com/openai/v1', needsKey: true },
+            {
+                label: 'Autre / Personnalisé…', description: '', needsKey: true,
+                detail: 'Entrer une URL manuellement'
+            },
         ];
 
         const urlPick = await vscode.window.showQuickPick(PRESET_URLS, {
-            title: 'Ajouter une clé API — 2/3',
-            placeHolder: 'Choisir le provider ou entrer une URL personnalisée',
+            title: 'Ajouter un provider — 2/3',
+            placeHolder: 'Choisir le type de provider',
+            matchOnDetail: true,
         });
         if (!urlPick) return;
 
         let url = urlPick.description;
         if (!url) {
+            const isOllama = urlPick.label.startsWith('⚡');
             const custom = await vscode.window.showInputBox({
-                title: 'URL de base de l\'API',
-                prompt: 'URL de base de l\'API (sans slash final)',
-                placeHolder: 'https://mon-serveur.com/v1',
+                title: "URL de base de l'API",
+                prompt: isOllama
+                    ? 'URL de votre serveur Ollama (ex: http://mon-vps:11434)'
+                    : "URL de base de l'API (sans slash final)",
+                placeHolder: isOllama ? 'http://mon-serveur:11434' : 'https://mon-serveur.com/v1',
                 ignoreFocusOut: true,
             });
             if (!custom) return;
             url = custom;
         }
 
+        const keyRequired = urlPick.needsKey;
         const key = await vscode.window.showInputBox({
-            title: 'Ajouter une clé API — 3/3',
-            prompt: `Clé API pour "${name}"`,
-            placeHolder: 'sk-…',
+            title: 'Ajouter un provider — 3/3',
+            prompt: keyRequired
+                ? `Clé API pour "${name}"`
+                : `Clé API pour "${name}" (optionnelle — laisser vide si Ollama sans auth)`,
+            placeHolder: keyRequired ? 'sk-…' : '(optionnel)',
             password: true,
             ignoreFocusOut: true,
         });
-        if (!key) return;
+        if (key === undefined) return;
 
-        const result = await this._ollamaClient.addApiKey({ name, url, key });
+        const result = await this._ollamaClient.addApiKey({ name, url, key: key || '' });
         if (!result.success) {
             vscode.window.showWarningMessage(`⚠️ ${result.reason}`);
             return;
         }
 
-        vscode.window.showInformationMessage(`✅ Clé "${name}" ajoutée avec succès.`);
-        await this._updateModelsList(url, key);
+        vscode.window.showInformationMessage(`✅ Provider "${name}" ajouté.`);
+        await this._updateModelsList(url, key || undefined);
     }
 
     private async _handleManageKeys() {
@@ -800,10 +818,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 try {
                     const isOpenAI = tmpKey.url.includes('together') || tmpKey.url.includes('openrouter') || tmpKey.url.endsWith('/v1');
                     const endpoint = isOpenAI ? `${tmpKey.url}/models` : `${tmpKey.url}/api/tags`;
-                    const res = await fetch(endpoint, {
-                        headers: { 'Authorization': `Bearer ${tmpKey.key}` },
-                        signal: AbortSignal.timeout(4000)
-                    });
+                    const tmpHeaders: Record<string, string> = {};
+                    if (tmpKey.key) tmpHeaders['Authorization'] = `Bearer ${tmpKey.key}`;
+                    const res = await fetch(endpoint, { headers: tmpHeaders, signal: AbortSignal.timeout(4000) });
                     if (res.ok) {
                         const data: any = await res.json();
                         const cloudList: string[] = isOpenAI

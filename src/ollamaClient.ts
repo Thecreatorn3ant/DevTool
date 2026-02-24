@@ -91,9 +91,12 @@ export class OllamaClient {
     }
 
     async addApiKey(entry: Omit<ApiKeyEntry, 'addedAt'>): Promise<{ success: boolean; reason?: string }> {
+        if (!entry.url) {
+            return { success: false, reason: 'Une URL est requise.' };
+        }
         const keys = this.getApiKeys();
-        if (keys.find(k => k.key === entry.key && k.url === entry.url)) {
-            return { success: false, reason: 'Cette clé existe déjà pour ce provider.' };
+        if (keys.find(k => k.url === entry.url && k.key === entry.key)) {
+            return { success: false, reason: 'Ce provider avec cette clé est déjà configuré.' };
         }
         keys.push({ ...entry, addedAt: Date.now() });
         await this._saveApiKeys(keys);
@@ -125,7 +128,6 @@ export class OllamaClient {
         await this._saveApiKeys(keys);
     }
 
-
     getApiKeyStatuses(): ApiKeyStatus[] {
         const now = Date.now();
         return this.getApiKeys().map(entry => {
@@ -145,7 +147,6 @@ export class OllamaClient {
             return { entry, status: 'available' as ApiKeyStatusCode, statusIcon: '🟢', statusLabel: 'Disponible' };
         });
     }
-
 
     private _getAvailableKey(targetUrl: string): { key: string; entry?: ApiKeyEntry } {
         const keys = this.getApiKeys();
@@ -174,7 +175,7 @@ export class OllamaClient {
         const updated = keys.map(k => {
             if (k.key === keyValue && k.url === url) {
                 changed = true;
-                return { ...k, rateLimitedUntil: now + 60_000 };
+                return { ...k, rateLimitedUntil: now + 60_000 }; // 60s de cooldown
             }
             return k;
         });
@@ -450,14 +451,14 @@ Règles :
 
         const savedKeys = this.getApiKeys();
         for (const entry of savedKeys) {
-            if (!entry.key || !entry.url) continue;
+            if (!entry.url) continue;
+            if (entry.url.includes('localhost') || entry.url.includes('127.0.0.1')) continue;
             try {
                 const isOpenAI = this._isOpenAI(entry.url);
                 const endpoint = isOpenAI ? `${entry.url}/models` : `${entry.url}/api/tags`;
-                const res = await fetch(endpoint, {
-                    headers: { 'Authorization': `Bearer ${entry.key}` },
-                    signal: AbortSignal.timeout(4000)
-                });
+                const fetchHeaders: Record<string, string> = {};
+                if (entry.key) fetchHeaders['Authorization'] = `Bearer ${entry.key}`;
+                const res = await fetch(endpoint, { headers: fetchHeaders, signal: AbortSignal.timeout(4000) });
                 if (res.ok) {
                     const data: any = await res.json();
                     const cloudList: string[] = isOpenAI
