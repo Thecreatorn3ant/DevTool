@@ -488,6 +488,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const parsed = parseAiResponse(response);
 
         for (const filePath of parsed.needFiles) {
+            const alreadyAvailable = this._contextFiles.some(f =>
+                f.name === filePath || f.name.endsWith(filePath) || filePath.endsWith(f.name)
+            );
+            if (alreadyAvailable) continue;
             const file = await this._fileCtxManager.handleAiFileRequest(filePath);
             if (file) {
                 this.addFilesToContext([{ ...file, isActive: false }]);
@@ -667,6 +671,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             { label: 'Together AI', description: 'https://api.together.xyz/v1', needsKey: true },
             { label: 'Mistral', description: 'https://api.mistral.ai/v1', needsKey: true },
             { label: 'Groq', description: 'https://api.groq.com/openai/v1', needsKey: true },
+            { label: 'Google Gemini', description: 'https://generativelanguage.googleapis.com/v1beta', needsKey: true },
             {
                 label: 'Autre / Personnalisé…', description: '', needsKey: true,
                 detail: 'Entrer une URL manuellement'
@@ -830,14 +835,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 : undefined;
 
             const allModels = await this._ollamaClient.listAllModels();
+            const PROVIDER_ICONS: Record<string, string> = {
+                local: '⚡', gemini: '✦', openai: '◈', openrouter: '◎',
+                together: '◉', mistral: '◆', groq: '▸', anthropic: '◈', 'ollama-cloud': '☁️'
+            };
             const formattedModels: Array<{
-                label: string; value: string; name: string; url: string; isLocal: boolean;
+                label: string; value: string; name: string; url: string; isLocal: boolean; provider: string;
             }> = allModels.map(m => ({
-                label: m.isLocal ? `⚡ ${m.name}` : `☁️  ${m.name}`,
+                label: `${PROVIDER_ICONS[m.provider] || '☁️'} ${m.name}`,
                 value: m.isLocal ? m.name : `${m.url}||${m.name}`,
                 name: m.name,
                 url: m.url,
-                isLocal: m.isLocal
+                isLocal: m.isLocal,
+                provider: m.provider
             }));
 
             if (tmpKey) {
@@ -855,7 +865,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         cloudList.forEach(m => {
                             const val = `${tmpKey.url}||${m}`;
                             if (!formattedModels.find(x => x.value === val)) {
-                                formattedModels.push({ label: `☁️  ${m}`, value: val, name: m, url: tmpKey.url, isLocal: false });
+                                formattedModels.push({ label: `☁️  ${m}`, value: val, name: m, url: tmpKey.url, isLocal: false, provider: 'ollama-cloud' });
                             }
                         });
                     }
@@ -980,7 +990,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             edit.replace(doc.uri, fullRange, previewText);
             await vscode.workspace.applyEdit(edit);
             await doc.save();
-            const editor = await vscode.window.showTextDocument(doc);
+            // Ferme le diff et ouvre le vrai fichier modifié au premier plan
+            await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+            const editor = await vscode.window.showTextDocument(doc, {
+                preview: false,
+                preserveFocus: false,
+                viewColumn: vscode.ViewColumn.Active
+            });
             this._highlightChangedLines(editor, oldText, previewText);
             vscode.window.showInformationMessage(
                 `✅ ${patchCount > 0 ? `${patchCount} patch(s) appliqué(s)` : 'Fichier remplacé'} et sauvegardé !`
@@ -1135,6 +1151,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "let currentAiText = '';",
             "let thinkModeActive = false;",
             "let userScrolledUp = false;",
+            "let _allModels = [];",
+            "",
+            "// ─── Provider color helper ───",
+            "var PROVIDER_COLORS = { local:'#b19cd9', gemini:'#7ab4f5', openai:'#74aa9c', openrouter:'#ffb74d', together:'#4dd0e1', mistral:'#ff8a80', groq:'#ffd700', anthropic:'#cc88ff', 'ollama-cloud':'#00d2ff' };",
+            "function providerColor(p) { return PROVIDER_COLORS[p] || '#00d2ff'; }",
+            "function providerBanner(p, name) {",
+            "    var icons = { local:'⚡', gemini:'✦', openai:'◈', openrouter:'◎', together:'◉', mistral:'◆', groq:'▸', anthropic:'◈', 'ollama-cloud':'☁️' };",
+            "    var labels = { local:'Mode Local', gemini:'Gemini', openai:'OpenAI', openrouter:'OpenRouter', together:'Together AI', mistral:'Mistral', groq:'Groq', anthropic:'Anthropic', 'ollama-cloud':'Ollama Cloud' };",
+            "    return (icons[p]||'☁️')+' <b>'+(labels[p]||'Cloud')+'</b> &mdash; '+name;",
+            "}",
+            "",
+            "// ─── Model search ───",
+            "var modelSearch = document.getElementById('modelSearch');",
+            "var btnModelSearch = document.getElementById('btnModelSearch');",
+            "btnModelSearch.onclick = function() {",
+            "    modelSearch.classList.toggle('open');",
+            "    if (modelSearch.classList.contains('open')) { modelSearch.focus(); }",
+            "    else { modelSearch.value = ''; renderModelOptions(_allModels, modelSelect.value); }",
+            "};",
+            "modelSearch.addEventListener('input', function() { renderModelOptions(_allModels, modelSelect.value); });",
+            "modelSearch.addEventListener('keydown', function(e) {",
+            "    if (e.key === 'Escape') { modelSearch.value = ''; modelSearch.classList.remove('open'); renderModelOptions(_allModels, modelSelect.value); }",
+            "});",
+            "function renderModelOptions(models, selectedVal) {",
+            "    var filter = modelSearch.value.toLowerCase().trim();",
+            "    var filtered = filter ? models.filter(function(x) { return x.name.toLowerCase().includes(filter) || (x.provider||'').toLowerCase().includes(filter); }) : models;",
+            "    if (filtered.length === 0) { modelSelect.innerHTML = '<option value=\"\" style=\"color:#666\">Aucun résultat</option>'; updateSelectColor(); return; }",
+            "    modelSelect.innerHTML = filtered.map(function(x) {",
+            "        var c = providerColor(x.provider);",
+            "        var s = x.value === selectedVal ? ' selected' : '';",
+            "        return '<option value=\"'+x.value+'\" data-name=\"'+x.name+'\" data-url=\"'+x.url+'\" data-provider=\"'+(x.provider||'')+('\" style=\"color:'+c+'\"'+s+'>'+x.label+'</option>');",
+            "    }).join('');",
+            "    updateSelectColor();",
+            "}",
             "",
             "// ─── Scroll lock logic ───",
             "chat.addEventListener('scroll', function() {",
@@ -1362,16 +1412,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "function updateSelectColor() {",
             "    var opt = modelSelect.options[modelSelect.selectedIndex];",
             "    if (!opt) return;",
-            "    var isLocal = !opt.getAttribute('data-url') || opt.getAttribute('data-url') === 'http://localhost:11434';",
-            "    modelSelect.style.color = isLocal ? '#b19cd9' : '#00d2ff';",
+            "    var provider = opt.getAttribute('data-provider') || 'ollama-cloud';",
+            "    var color = providerColor(provider);",
+            "    modelSelect.style.color = color;",
             "    var warn = document.getElementById('localWarn');",
             "    if (!opt.value) {",
-            "        warn.className = 'offline'; warn.innerHTML = '⚠️ Ollama hors ligne'; warn.style.display = 'block';",
-            "    } else if (isLocal) {",
-            "        warn.className = 'local'; warn.innerHTML = '⚡ <b>Mode Local</b> &mdash; ' + (opt.getAttribute('data-name') || '');",
-            "        warn.style.display = 'block';",
+            "        warn.style.cssText = ''; warn.className = 'offline';",
+            "        warn.innerHTML = '⚠️ Ollama hors ligne'; warn.style.display = 'block';",
             "    } else {",
-            "        warn.className = 'cloud'; warn.innerHTML = '☁️ <b>Mode Cloud</b> &mdash; ' + (opt.getAttribute('data-name') || '');",
+            "        warn.className = provider;",
+            "        warn.innerHTML = providerBanner(provider, opt.getAttribute('data-name') || '');",
             "        warn.style.display = 'block';",
             "    }",
             "    vscode.postMessage({ type: 'getTokenBudget' });",
@@ -1385,14 +1435,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "window.addEventListener('message', function(e) {",
             "    var m = e.data;",
             "    if (m.type === 'setModels') {",
-            "        modelSelect.innerHTML = m.models && m.models.length > 0",
-            "            ? m.models.map(function(x) {",
-            "                var color = x.isLocal ? '#b19cd9' : '#00d2ff';",
-            "                var sel = x.value === m.selected ? 'selected' : '';",
-            "                return '<option value=\"'+x.value+'\" data-name=\"'+x.name+'\" data-url=\"'+x.url+'\" style=\"color:'+color+'\" '+sel+'>'+x.label+'</option>';",
-            "              }).join('')",
-            "            : '<option value=\"\" data-name=\"\" data-url=\"\" style=\"color:#ff6b6b\">⚠️ Ollama hors ligne</option>';",
-            "        updateSelectColor();",
+            "        if (m.models && m.models.length > 0) {",
+            "            _allModels = m.models;",
+            "            renderModelOptions(m.models, m.selected);",
+            "        } else {",
+            "            _allModels = [];",
+            "            modelSelect.innerHTML = '<option value=\"\" data-name=\"\" data-url=\"\" data-provider=\"\" style=\"color:#ff6b6b\">⚠️ Ollama hors ligne</option>';",
+            "            updateSelectColor();",
+            "        }",
             "    }",
             "    if (m.type === 'startResponse') {",
             "        currentAiMsg = document.createElement('div');",
@@ -1492,6 +1542,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .btn-cloud { background: none; border: 1px solid #00d2ff; color: #00d2ff; padding: 4px 10px; font-size: 11px; border-radius: 20px; cursor: pointer; font-weight: 700; transition: all 0.2s; }
         .btn-cloud:hover { background: rgba(0,210,255,0.15); }
         select#modelSelect { max-width: 150px; padding: 4px 6px; border-radius: 20px; background: #0a0a1a; border: 1px solid #444; outline: none; font-size: 11px; color: #00d2ff; cursor: pointer; }
+        /* ── Model search ── */
+        #modelSearchWrap { display: flex; align-items: center; gap: 3px; }
+        #modelSearch { background: rgba(20,20,40,0.9); color: #e0e0e0; border: 1px solid #333; border-radius: 20px; padding: 3px 8px; font-size: 11px; outline: none; width: 0; max-width: 0; opacity: 0; transition: all 0.25s; font-family: 'Inter', sans-serif; }
+        #modelSearch.open { width: 90px; max-width: 90px; opacity: 1; border-color: rgba(0,210,255,0.4); }
+        #btnModelSearch { background: none; border: none; color: #555; cursor: pointer; font-size: 12px; padding: 0; transition: color 0.2s; line-height: 1; }
+        #btnModelSearch:hover { color: #00d2ff; }
+        /* ── Provider-aware localWarn ── */
+        #localWarn.gemini    { background: rgba(66,133,244,0.1);  color: #7ab4f5;  border-color: rgba(66,133,244,0.3); }
+        #localWarn.openai    { background: rgba(116,170,156,0.1); color: #74aa9c;  border-color: rgba(116,170,156,0.3); }
+        #localWarn.openrouter{ background: rgba(255,152,0,0.1);   color: #ffb74d;  border-color: rgba(255,152,0,0.3); }
+        #localWarn.mistral   { background: rgba(255,107,107,0.1); color: #ff8a80;  border-color: rgba(255,107,107,0.3); }
+        #localWarn.groq      { background: rgba(255,215,0,0.1);   color: #ffd700;  border-color: rgba(255,215,0,0.3); }
+        #localWarn.together  { background: rgba(0,188,212,0.1);   color: #4dd0e1;  border-color: rgba(0,188,212,0.3); }
+        #localWarn.anthropic { background: rgba(204,136,255,0.1); color: #cc88ff;  border-color: rgba(204,136,255,0.3); }
         #localWarn { display: none; padding: 4px 12px; font-size: 11px; text-align: center; border-bottom: 1px solid; flex-shrink: 0; }
         #localWarn.local { background: rgba(177,156,217,0.12); color: #c9a9f5; border-color: rgba(177,156,217,0.25); }
         #localWarn.cloud { background: rgba(0,210,255,0.08); color: #00d2ff; border-color: rgba(0,210,255,0.2); }
@@ -1557,7 +1621,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <span class="header-brand">ANTIGRAVITY</span>
         <div class="header-controls">
             <button class="btn-cloud" id="btnCloud">☁️ Cloud</button>
-            <select id="modelSelect"></select>
+            <div id="modelSearchWrap">
+                <button id="btnModelSearch" title="Rechercher un modèle">🔍</button>
+                <input id="modelSearch" type="text" placeholder="Filtrer…" autocomplete="off" spellcheck="false">
+                <select id="modelSelect"></select>
+            </div>
         </div>
     </div>
     <div id="localWarn"></div>
