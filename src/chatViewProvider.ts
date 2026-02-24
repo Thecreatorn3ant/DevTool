@@ -194,7 +194,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _currentModel: string = 'llama3';
     private _currentUrl: string = '';
     private _terminalPermission: 'ask-all' | 'ask-important' | 'allow-all' = 'ask-all';
-    private _filePermission: 'ask-all' | 'ask-workspace' | 'allow-all' = 'ask-workspace';
     private static readonly _previewProvider = new AiPreviewProvider();
     private static _providerRegistered = false;
 
@@ -205,7 +204,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ) {
         this._history = this._context.workspaceState.get<ChatMessage[]>('chatHistory', []);
         this._terminalPermission = this._context.workspaceState.get<'ask-all' | 'ask-important' | 'allow-all'>('terminalPermission', 'ask-all');
-        this._filePermission = this._context.workspaceState.get<'ask-all' | 'ask-workspace' | 'allow-all'>('filePermission', 'ask-workspace');
         if (!ChatViewProvider._providerRegistered) {
             this._context.subscriptions.push(
                 vscode.workspace.registerTextDocumentContentProvider(
@@ -315,13 +313,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'getTerminalPermission':
                     webviewView.webview.postMessage({ type: 'setTerminalPermission', value: this._terminalPermission });
                     break;
-                case 'setFilePermission':
-                    this._filePermission = data.value || 'ask-workspace';
-                    this._context.workspaceState.update('filePermission', this._filePermission);
-                    break;
-                case 'getFilePermission':
-                    webviewView.webview.postMessage({ type: 'setFilePermission', value: this._filePermission });
-                    break;
                 case 'runCommand':
                     if (data.value) await this._handleRunCommand(data.value, data.isImportant === true);
                     break;
@@ -354,13 +345,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     public async analyzeError(errorText: string) {
         if (!this._view) return;
 
-        vscode.window.showInformationMessage('Analyse de l\'erreur en cours...');
+        this._view.webview.postMessage({ type: 'statusMessage', value: '🔍 Analyse de l\'erreur en cours...' });
 
         const relatedFiles = await this._fileCtxManager.findFilesForError(errorText);
 
         if (relatedFiles.length > 0) {
             this.addFilesToContext(relatedFiles);
-            vscode.window.showInformationMessage(`${relatedFiles.length} fichier(s) detecte(s) automatiquement : ${relatedFiles.map(f => f.name).join(', ')}`);
+            this._view.webview.postMessage({
+                type: 'statusMessage',
+                value: `📁 ${relatedFiles.length} fichier(s) détecté(s) automatiquement : ${relatedFiles.map(f => f.name).join(', ')}`
+            });
         }
 
         setTimeout(() => {
@@ -503,10 +497,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 f.name === filePath || f.name.endsWith(filePath) || filePath.endsWith(f.name)
             );
             if (alreadyAvailable) continue;
-            const file = await this._fileCtxManager.handleAiFileRequest(filePath, this._filePermission);
+            const _fp = this._terminalPermission === 'allow-all' ? 'allow-all'
+                : this._terminalPermission === 'ask-important' ? 'ask-workspace'
+                : 'ask-all';
+            const file = await this._fileCtxManager.handleAiFileRequest(filePath, _fp);
             if (file) {
                 this.addFilesToContext([{ ...file, isActive: false }]);
-                vscode.window.showInformationMessage(`Fichier "${file.name}" ajoute au contexte IA.`);
+                this._view?.webview.postMessage({
+                    type: 'statusMessage',
+                    value: `📁 Fichier "${file.name}" ajouté au contexte IA.`
+                });
             }
         }
 
@@ -583,7 +583,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         this.addFilesToContext(related);
-        vscode.window.showInformationMessage(`${related.length} fichier(s) lies ajoutes : ${related.map(f => f.name).join(', ')}`);
+        this._view?.webview.postMessage({
+            type: 'statusMessage',
+            value: `🔗 ${related.length} fichier(s) lié(s) ajouté(s) : ${related.map(f => f.name).join(', ')}`
+        });
     }
 
     private async _handleCloudConnection() {
@@ -898,9 +901,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private _sendTokenBudget() {
         if (!this._view) return;
-        const url = this._currentUrl || '';
-        const isCloud = url ? this._ollamaClient.isCloud(url) : false;
-        const budget = this._ollamaClient.getTokenBudget(this._currentModel || 'llama3', url || undefined);
+        const isCloud = this._ollamaClient.isCloud(this._currentUrl || undefined);
+        const budget = this._ollamaClient.getTokenBudget(this._currentModel || 'llama3', this._currentUrl || undefined);
         const usedChars = this._contextFiles.reduce((sum, f) => sum + f.content.length, 0);
         this._view.webview.postMessage({
             type: 'tokenBudget',
@@ -935,7 +937,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private async _handleFileAccessRequest(target: string) {
         if (target === 'env' || target === '.env') {
-            const file = await this._fileCtxManager.handleAiFileRequest('.env', this._filePermission);
+            const _fp2 = this._terminalPermission === 'allow-all' ? 'allow-all'
+                : this._terminalPermission === 'ask-important' ? 'ask-workspace'
+                : 'ask-all';
+            const file = await this._fileCtxManager.handleAiFileRequest('.env', _fp2);
             if (file) {
                 this._view?.webview.postMessage({ type: 'fileContent', name: file.name, content: file.content });
             }
@@ -1295,10 +1300,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "termPermSelect.onchange = function() {",
             "    vscode.postMessage({ type: 'setTerminalPermission', value: termPermSelect.value });",
             "};",
-            "var filePermSelect = document.getElementById('filePermSelect');",
-            "filePermSelect.onchange = function() {",
-            "    vscode.postMessage({ type: 'setFilePermission', value: filePermSelect.value });",
-            "};",
             "",
             "// ─── Auto-resize textarea ───",
             "prompt.addEventListener('input', function() {",
@@ -1593,9 +1594,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "    if (m.type === 'setTerminalPermission') {",
             "        termPermSelect.value = m.value || 'ask-all';",
             "    }",
-            "    if (m.type === 'setFilePermission') {",
-            "        filePermSelect.value = m.value || 'ask-workspace';",
-            "    }",
             "    if (m.type === 'showPlan') {",
             "        var planEl = document.createElement('div');",
             "        planEl.className = 'msg plan-msg';",
@@ -1617,8 +1615,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "vscode.postMessage({ type: 'getModels' });",
             "vscode.postMessage({ type: 'restoreHistory' });",
             "vscode.postMessage({ type: 'getTokenBudget' });",
-            "vscode.postMessage({ type: 'getTerminalPermission' });",
-            "vscode.postMessage({ type: 'getFilePermission' });"
+            "vscode.postMessage({ type: 'getTerminalPermission' });"
         ].join("\n");
 
         return `<!DOCTYPE html>
@@ -1721,7 +1718,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         #terminalLog .cmd-text { color: #ccc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         /* ── Terminal permission select ── */
         #termPermSelect { background: rgba(20,20,40,0.8); color: #aaa; border: 1px solid #333; border-radius: 12px; padding: 3px 8px; font-size: 10px; cursor: pointer; outline: none; font-family: 'Inter', sans-serif; }
-        #filePermSelect { background: rgba(20,20,40,0.8); color: #aaa; border: 1px solid #333; border-radius: 12px; padding: 3px 8px; font-size: 10px; cursor: pointer; outline: none; font-family: 'Inter', sans-serif; }
         /* ── Scroll-to-bottom FAB ── */
         #scrollBtn { display: none; position: absolute; bottom: 14px; right: 14px; width: 32px; height: 32px; border-radius: 50%; background: rgba(0,210,255,0.2); border: 1px solid rgba(0,210,255,0.4); color: #00d2ff; font-size: 16px; cursor: pointer; align-items: center; justify-content: center; transition: all 0.2s; z-index: 10; }
         #scrollBtn:hover { background: rgba(0,210,255,0.35); }
@@ -1762,15 +1758,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             <button class="btn-action" id="btnCommit" title="Générer un message de commit">💾 Commit</button>
             <button class="btn-action" id="btnTests" title="Générer les tests du fichier actif">🧪 Tests</button>
             <button class="btn-action" id="btnClearHistory" title="Effacer l'historique">🗑 Vider</button>
-            <select id="termPermSelect" title="Permissions terminal IA">
-                <option value="ask-all">💻 Demander toujours</option>
-                <option value="ask-important">⚠️ Demander si important</option>
+            <select id="termPermSelect" title="Permissions IA (terminal + fichiers)">
+                <option value="ask-all">🔒 Demander toujours</option>
+                <option value="ask-important">📁 Workspace libre</option>
                 <option value="allow-all">🚀 Autoriser tout</option>
-            </select>
-            <select id="filePermSelect" title="Permissions acces fichiers IA">
-                <option value="ask-workspace">📁 Hors workspace = demander</option>
-                <option value="ask-all">🔒 Demander chaque fichier</option>
-                <option value="allow-all">🗂 Acces libre</option>
             </select>
         </div>
         <div class="input-row">
