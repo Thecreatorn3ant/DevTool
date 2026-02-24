@@ -2,5 +2,44 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
-  ]
+  ],
+  "baseBranches": [
+    "dev"
+  ],
+  "packageRules": [
+    {
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "matchCurrentVersion": "!/^0/",
+      "automerge": false
+    },
+    {
+      "description": "Regrouper toutes les mises à jour de types (devDependencies) dans une seule PR",
+      "matchPackagePatterns": [
+        "^@types/"
+      ],
+      "groupName": "TypeScript Types"
+    },
+    {
+      "description": "Regrouper les mises à jour ESLint",
+      "matchPackagePatterns": [
+        "eslint"
+      ],
+      "groupName": "Linting Tools"
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "addLabels": [
+      "security"
+    ]
+  },
+  "labels": [
+    "dependencies",
+    "renovate"
+  ],
+  "rangeStrategy": "pin",
+  "timezone": "Europe/Paris"
 }
