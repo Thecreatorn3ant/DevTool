@@ -3,6 +3,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { OllamaClient, ContextFile, ApiKeyStatus, estimateTokens } from './ollamaClient';
 import { FileContextManager } from './fileContextManager';
+import { LspDiagnosticsManager } from './lspDiagnosticsManager';
+import { AgentRunner, AgentSession } from './agentRunner';
 
 interface ChatMessage {
     role: 'user' | 'ai';
@@ -196,6 +198,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _terminalPermission: 'ask-all' | 'ask-important' | 'allow-all' = 'ask-all';
     private static readonly _previewProvider = new AiPreviewProvider();
     private static _providerRegistered = false;
+    private _lspManager: LspDiagnosticsManager;
+    private _agentRunner: AgentRunner;
+    private _agentSession: AgentSession | null = null;
+    private _lspWatchActive: boolean = false;
 
     constructor(
         private readonly _context: vscode.ExtensionContext,
@@ -204,6 +210,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ) {
         this._history = this._context.workspaceState.get<ChatMessage[]>('chatHistory', []);
         this._terminalPermission = this._context.workspaceState.get<'ask-all' | 'ask-important' | 'allow-all'>('terminalPermission', 'ask-all');
+        this._lspManager = new LspDiagnosticsManager(this._context);
+        this._agentRunner = new AgentRunner(this._ollamaClient, this._fileCtxManager, this._lspManager, this._context);
         if (!ChatViewProvider._providerRegistered) {
             this._context.subscriptions.push(
                 vscode.workspace.registerTextDocumentContentProvider(
@@ -252,7 +260,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         this._currentModel = data.model || 'llama3';
                         this._currentUrl = '';
                     }
-                    this._sendTokenBudget();
                     break;
                 case 'restoreHistory':
                     webviewView.webview.postMessage({ type: 'restoreHistory', history: this._history });
@@ -317,6 +324,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'runCommand':
                     if (data.value) await this._handleRunCommand(data.value, data.isImportant === true);
                     break;
+                case 'getLspDiagnostics':
+                    this._handleGetLspDiagnostics(data.scope || 'active');
+                    break;
+                case 'toggleLspWatch':
+                    this._handleToggleLspWatch();
+                    break;
+                case 'runAgent':
+                    if (data.goal) await this._handleRunAgent(data.goal);
+                    break;
+                case 'stopAgent':
+                    this._agentRunner.stop();
+                    this._view?.webview.postMessage({ type: 'agentStopped' });
+                    break;
             }
         });
     }
@@ -341,6 +361,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             files: this._contextFiles.map(f => ({ name: f.name, tokens: estimateTokens(f.content) }))
         });
         this._sendTokenBudget();
+    }
+
+    public triggerLspAnalysis(scope: 'active' | 'workspace' | 'errors-only' = 'workspace') {
+        this._handleGetLspDiagnostics(scope);
+    }
+
+    public async runAgentFromCommand(goal: string) {
+        await this._handleRunAgent(goal);
     }
 
     public async analyzeError(errorText: string) {
@@ -498,10 +526,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 f.name === filePath || f.name.endsWith(filePath) || filePath.endsWith(f.name)
             );
             if (alreadyAvailable) continue;
-            const _fp = this._terminalPermission === 'allow-all' ? 'allow-all'
-                : this._terminalPermission === 'ask-important' ? 'ask-workspace'
-                : 'ask-all';
-            const file = await this._fileCtxManager.handleAiFileRequest(filePath, _fp);
+            const file = await this._fileCtxManager.handleAiFileRequest(filePath);
             if (file) {
                 this.addFilesToContext([{ ...file, isActive: false }]);
                 this._view?.webview.postMessage({
@@ -902,9 +927,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private _sendTokenBudget() {
         if (!this._view) return;
-        const url = this._currentUrl && this._currentUrl.trim() ? this._currentUrl : undefined;
-        const isCloud = url ? this._ollamaClient.isCloud(url) : false;
-        const budget = this._ollamaClient.getTokenBudget(this._currentModel || 'llama3', url);
+        const isCloud = this._ollamaClient.isCloud(this._currentUrl || undefined);
+        const budget = this._ollamaClient.getTokenBudget(this._currentModel || 'llama3', this._currentUrl || undefined);
         const usedChars = this._contextFiles.reduce((sum, f) => sum + f.content.length, 0);
         this._view.webview.postMessage({
             type: 'tokenBudget',
@@ -939,10 +963,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private async _handleFileAccessRequest(target: string) {
         if (target === 'env' || target === '.env') {
-            const _fp2 = this._terminalPermission === 'allow-all' ? 'allow-all'
-                : this._terminalPermission === 'ask-important' ? 'ask-workspace'
-                : 'ask-all';
-            const file = await this._fileCtxManager.handleAiFileRequest('.env', _fp2);
+            const file = await this._fileCtxManager.handleAiFileRequest('.env');
             if (file) {
                 this._view?.webview.postMessage({ type: 'fileContent', name: file.name, content: file.content });
             }
@@ -1149,6 +1170,120 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.sendMessageFromEditor(
             `Génère un résumé technique de ce projet en 200-300 mots. Inclus : technos principales, architecture, rôle des dossiers clés, patterns utilisés. Encadre ta réponse avec [PROJECT_SUMMARY] et [/PROJECT_SUMMARY].`
         );
+    }
+
+    private _handleGetLspDiagnostics(scope: 'active' | 'workspace' | 'errors-only') {
+        const report = this._lspManager.getSnapshot(scope);
+        const formatted = this._lspManager.formatForPrompt(report);
+        this._view?.webview.postMessage({
+            type: 'lspDiagnostics',
+            report: {
+                summary: report.summary,
+                errorCount: report.errorCount,
+                warningCount: report.warningCount,
+                affectedFiles: report.affectedFiles,
+                formatted,
+            }
+        });
+    }
+
+    private _handleToggleLspWatch() {
+        this._lspWatchActive = this._lspManager.toggleWatch((report) => {
+            if (!this._view) return;
+            if (report.errorCount === 0) return;
+            const formatted = this._lspManager.formatForPrompt(report, 10);
+            this._view.webview.postMessage({
+                type: 'lspAutoReport',
+                summary: report.summary,
+                errorCount: report.errorCount,
+                formatted,
+            });
+        });
+        this._view?.webview.postMessage({
+            type: 'lspWatchToggled',
+            active: this._lspWatchActive
+        });
+        vscode.window.showInformationMessage(
+            this._lspWatchActive
+                ? "👁 Surveillance LSP activée — l'IA sera notifiée des nouvelles erreurs."
+                : '👁 Surveillance LSP désactivée.'
+        );
+    }
+
+    private async _handleRunAgent(goal: string) {
+        if (this._agentRunner.isRunning()) {
+            vscode.window.showWarningMessage("Un agent est déjà en cours. Arrêtez-le avant d'en lancer un nouveau.");
+            return;
+        }
+
+        const model = this._currentModel || 'llama3';
+        const url = this._currentUrl || '';
+
+        this._view?.webview.postMessage({ type: 'agentStarted', goal });
+
+        this._agentRunner.onEvent((event) => {
+            if (!this._view) return;
+            switch (event.type) {
+                case 'step_start':
+                    this._view.webview.postMessage({
+                        type: 'agentStep',
+                        status: 'running',
+                        stepId: event.step!.id,
+                        stepType: event.step!.type,
+                        description: event.step!.description,
+                        totalSteps: event.session.steps.length,
+                    });
+                    break;
+                case 'step_done':
+                    this._view.webview.postMessage({
+                        type: 'agentStep',
+                        status: 'done',
+                        stepId: event.step!.id,
+                        stepType: event.step!.type,
+                        description: event.step!.description,
+                        output: event.step!.output,
+                        durationMs: event.step!.durationMs,
+                    });
+                    break;
+                case 'step_failed':
+                    this._view.webview.postMessage({
+                        type: 'agentStep',
+                        status: 'failed',
+                        stepId: event.step!.id,
+                        stepType: event.step!.type,
+                        description: event.step!.description,
+                        output: event.step!.output,
+                    });
+                    break;
+                case 'session_done':
+                    this._view.webview.postMessage({
+                        type: 'agentDone',
+                        summary: event.message,
+                        steps: event.session.steps.length,
+                    });
+                    break;
+                case 'session_failed':
+                    this._view.webview.postMessage({
+                        type: 'agentFailed',
+                        reason: event.message,
+                    });
+                    break;
+                case 'log':
+                    this._view.webview.postMessage({
+                        type: 'agentLog',
+                        message: event.message,
+                    });
+                    break;
+            }
+        });
+
+        const initialContext = [...this._contextFiles];
+        const activeFile = await this._fileCtxManager.getActiveFile(8000);
+        if (activeFile && !initialContext.find(f => f.name === activeFile.name)) {
+            initialContext.unshift(activeFile);
+        }
+
+        this._agentSession = await this._agentRunner.run(goal, model, url, initialContext);
     }
 
     private _getHtmlForWebview(webview: vscode.Webview): string {
@@ -1484,6 +1619,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "        chat.innerHTML = '';",
             "    }",
             "};",
+            "document.getElementById('btnLsp').onclick = function() {",
+            "    vscode.postMessage({ type: 'getLspDiagnostics', scope: 'workspace' });",
+            "};",
+            "var _lspWatchActive = false;",
+            "document.getElementById('btnLspWatch').onclick = function() {",
+            "    vscode.postMessage({ type: 'toggleLspWatch' });",
+            "};",
+            "document.getElementById('btnAgent').onclick = function() {",
+            "    if (_agentRunning) { vscode.postMessage({ type: 'stopAgent' }); return; }",
+            "    var goal = prompt.value.trim();",
+            "    if (!goal) { goal = window.prompt('Objectif de l\\'agent :'); }",
+            "    if (!goal) return;",
+            "    prompt.value = '';",
+            "    vscode.postMessage({ type: 'runAgent', goal: goal });",
+            "};",
+            "function stopAgent() { vscode.postMessage({ type: 'stopAgent' }); }",
+            "function sendLspToAi() {",
+            "    if (!_currentLspFormatted) return;",
+            "    prompt.value = 'Analyse ces erreurs LSP et propose les correctifs :\\n' + _currentLspFormatted;",
+            "    document.getElementById('lspPanel').style.display = 'none';",
+            "    prompt.focus();",
+            "}",
             "document.getElementById('btnGitReview').onclick = function() {",
             "    vscode.postMessage({ type: 'reviewDiff' });",
             "};",
@@ -1596,6 +1753,77 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "    if (m.type === 'setTerminalPermission') {",
             "        termPermSelect.value = m.value || 'ask-all';",
             "    }",
+            "    if (m.type === 'lspDiagnostics') {",
+            "        var panel = document.getElementById('lspPanel');",
+            "        var content = document.getElementById('lspContent');",
+            "        var summary = document.getElementById('lspSummary');",
+            "        _currentLspFormatted = m.report.formatted;",
+            "        summary.innerHTML = (m.report.errorCount > 0 ? '🔴' : '🟡') + ' ' + escapeHtml(m.report.summary);",
+            "        content.textContent = m.report.formatted;",
+            "        panel.style.display = 'block';",
+            "    }",
+            "    if (m.type === 'lspAutoReport') {",
+            "        var d = document.createElement('div');",
+            "        d.className = 'status-msg';",
+            "        d.style.cssText = 'color:#ff8888;border-color:rgba(255,80,80,0.3);';",
+            "        d.innerHTML = '🔴 ' + escapeHtml(m.summary) + ' <button onclick=\\'sendLspToAi()\\' style=\\'margin-left:8px;background:rgba(255,80,80,0.2);border:1px solid rgba(255,80,80,0.4);color:#ff8888;border-radius:8px;padding:2px 8px;cursor:pointer;font-size:10px;\\'>Corriger</button>';",
+            "        chat.appendChild(d); smartScroll();",
+            "        setTimeout(function() { d.remove(); }, 12000);",
+            "        _currentLspFormatted = m.formatted;",
+            "    }",
+            "    if (m.type === 'lspWatchToggled') {",
+            "        _lspWatchActive = m.active;",
+            "        var btn = document.getElementById('btnLspWatch');",
+            "        btn.style.background = m.active ? 'rgba(255,80,80,0.2)' : '';",
+            "        btn.style.borderColor = m.active ? 'rgba(255,80,80,0.5)' : '';",
+            "        btn.style.color = m.active ? '#ff8888' : '';",
+            "    }",
+            "    if (m.type === 'agentStarted') {",
+            "        _agentRunning = true;",
+            "        var panel = document.getElementById('agentPanel');",
+            "        var steps = document.getElementById('agentSteps');",
+            "        var label = document.getElementById('agentGoalLabel');",
+            "        label.textContent = '🤖 ' + m.goal;",
+            "        steps.innerHTML = '';",
+            "        panel.style.display = 'block';",
+            "        var btn = document.getElementById('btnAgent');",
+            "        btn.textContent = '⏹ Stop'; btn.style.background = 'rgba(255,80,80,0.2)';",
+            "        btn.style.borderColor = 'rgba(255,80,80,0.5)'; btn.style.color = '#ff8888';",
+            "    }",
+            "    if (m.type === 'agentStep') {",
+            "        var stepIcons = { think:'💭', read_file:'📖', write_file:'✏️', run_command:'💻', fix_diagnostics:'🔍', done:'✅', error:'❌' };",
+            "        var icon = stepIcons[m.stepType] || '▸';",
+            "        var existing = document.getElementById('agent-step-'+m.stepId);",
+            "        if (!existing) {",
+            "            existing = document.createElement('div');",
+            "            existing.id = 'agent-step-'+m.stepId;",
+            "            existing.className = 'agent-step';",
+            "            document.getElementById('agentSteps').appendChild(existing);",
+            "        }",
+            "        var dur = m.durationMs ? '<span class=\"agent-step-dur\">('+Math.round(m.durationMs/100)/10+'s)</span>' : '';",
+            "        var out = m.output ? '<div class=\"agent-step-out\">'+escapeHtml(m.output.substring(0,120))+'</div>' : '';",
+            "        existing.className = 'agent-step step-'+m.status;",
+            "        existing.innerHTML = '<div class=\"agent-step-icon\">'+icon+'</div><div class=\"agent-step-body\"><div class=\"agent-step-desc\">'+escapeHtml(m.description)+dur+'</div>'+out+'</div>';",
+            "        document.getElementById('agentSteps').scrollTop = 9999;",
+            "    }",
+            "    if (m.type === 'agentDone' || m.type === 'agentStopped' || m.type === 'agentFailed') {",
+            "        _agentRunning = false;",
+            "        var btn = document.getElementById('btnAgent');",
+            "        btn.textContent = '🤖 Agent'; btn.style.background = ''; btn.style.borderColor = ''; btn.style.color = '';",
+            "        var color = m.type === 'agentDone' ? '#6debb0' : '#ff8888';",
+            "        var icon = m.type === 'agentDone' ? '✅' : '❌';",
+            "        var msg = icon + ' Agent terminé — ' + (m.summary || m.reason || 'arrêté');",
+            "        var d = document.createElement('div'); d.className = 'status-msg';",
+            "        d.style.color = color; d.textContent = msg;",
+            "        chat.appendChild(d); smartScroll();",
+            "        setTimeout(function() { d.remove(); }, 8000);",
+            "    }",
+            "    if (m.type === 'agentLog') {",
+            "        var d2 = document.createElement('div'); d2.className = 'status-msg';",
+            "        d2.style.fontSize = '10px'; d2.textContent = m.message;",
+            "        chat.appendChild(d2); smartScroll();",
+            "        setTimeout(function() { d2.remove(); }, 6000);",
+            "    }",
             "    if (m.type === 'showPlan') {",
             "        var planEl = document.createElement('div');",
             "        planEl.className = 'msg plan-msg';",
@@ -1617,7 +1845,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "vscode.postMessage({ type: 'getModels' });",
             "vscode.postMessage({ type: 'restoreHistory' });",
             "vscode.postMessage({ type: 'getTokenBudget' });",
-            "vscode.postMessage({ type: 'getTerminalPermission' });"
+            "vscode.postMessage({ type: 'getTerminalPermission' });",
+            "var _currentLspFormatted = '';",
+            "var _agentRunning = false;"
         ].join("\n");
 
         return `<!DOCTYPE html>
@@ -1720,6 +1950,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         #terminalLog .cmd-text { color: #ccc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         /* ── Terminal permission select ── */
         #termPermSelect { background: rgba(20,20,40,0.8); color: #aaa; border: 1px solid #333; border-radius: 12px; padding: 3px 8px; font-size: 10px; cursor: pointer; outline: none; font-family: 'Inter', sans-serif; }
+        /* ── Agent panel ── */
+        #agentPanel { background: rgba(0,0,0,0.55); border-top: 1px solid rgba(120,0,255,0.3); padding: 6px 10px; font-size: 11px; max-height: 160px; overflow-y: auto; flex-shrink: 0; }
+        #agentHeader { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; color: #cc88ff; font-weight: 700; }
+        #agentHeader button { background: rgba(255,80,80,0.15); border: 1px solid rgba(255,80,80,0.3); color: #ff8888; padding: 2px 8px; border-radius: 8px; cursor: pointer; font-size: 10px; }
+        .agent-step { display: flex; gap: 6px; align-items: flex-start; padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
+        .agent-step-icon { flex-shrink: 0; width: 16px; text-align: center; }
+        .agent-step-body { flex: 1; min-width: 0; }
+        .agent-step-desc { color: #ccc; }
+        .agent-step-out { color: #777; font-size: 10px; font-family: 'Fira Code', monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .agent-step-dur { color: #555; font-size: 10px; margin-left: 4px; }
+        .step-running .agent-step-desc { color: #00d2ff; }
+        .step-done .agent-step-desc { color: #6debb0; }
+        .step-failed .agent-step-desc { color: #ff8888; }
+        /* ── LSP panel ── */
+        #lspPanel { background: rgba(0,0,0,0.55); border-top: 1px solid rgba(255,80,80,0.3); padding: 6px 10px; font-size: 11px; max-height: 180px; overflow-y: auto; flex-shrink: 0; }
+        #lspHeader { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; color: #ff8888; font-weight: 700; }
+        #lspHeader button { background: none; border: none; color: #666; cursor: pointer; font-size: 13px; }
+        #lspContent { font-family: 'Fira Code', monospace; font-size: 10px; color: #ccc; white-space: pre-wrap; line-height: 1.6; }
+        #lspActions { margin-top: 6px; display: flex; gap: 6px; }
+        #lspActions button { background: rgba(0,122,204,0.25); border: 1px solid rgba(0,122,204,0.4); color: #6cb6ff; padding: 3px 10px; border-radius: 8px; cursor: pointer; font-size: 11px; }
+        #lspActions button:hover { background: rgba(0,122,204,0.45); }
         /* ── Scroll-to-bottom FAB ── */
         #scrollBtn { display: none; position: absolute; bottom: 14px; right: 14px; width: 32px; height: 32px; border-radius: 50%; background: rgba(0,210,255,0.2); border: 1px solid rgba(0,210,255,0.4); color: #00d2ff; font-size: 16px; cursor: pointer; align-items: center; justify-content: center; transition: all 0.2s; z-index: 10; }
         #scrollBtn:hover { background: rgba(0,210,255,0.35); }
@@ -1750,6 +2001,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <button id="scrollBtn" title="Retour en bas">↓</button>
     </div>
     <div id="terminalLog"></div>
+    <div id="agentPanel" style="display:none">
+        <div id="agentHeader">
+            <span id="agentGoalLabel">🤖 Agent</span>
+            <button id="agentStopBtn" onclick="stopAgent()">⏹ Stop</button>
+        </div>
+        <div id="agentSteps"></div>
+    </div>
+    <div id="lspPanel" style="display:none">
+        <div id="lspHeader">
+            <span id="lspSummary">🔴 LSP</span>
+            <button onclick="document.getElementById('lspPanel').style.display='none'">✕</button>
+        </div>
+        <div id="lspContent"></div>
+        <div id="lspActions">
+            <button onclick="sendLspToAi()">🤖 Envoyer à l'IA</button>
+            <button onclick="document.getElementById('lspPanel').style.display='none'">Fermer</button>
+        </div>
+    </div>
     <div class="input-area">
         <div class="input-actions">
             <button class="btn-action" id="btnAddFile" title="Ajouter un fichier au contexte">📎 Fichier</button>
@@ -1760,9 +2029,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             <button class="btn-action" id="btnCommit" title="Générer un message de commit">💾 Commit</button>
             <button class="btn-action" id="btnTests" title="Générer les tests du fichier actif">🧪 Tests</button>
             <button class="btn-action" id="btnClearHistory" title="Effacer l'historique">🗑 Vider</button>
-            <select id="termPermSelect" title="Permissions IA (terminal + fichiers)">
-                <option value="ask-all">🔒 Demander toujours</option>
-                <option value="ask-important">📁 Workspace libre</option>
+            <button class="btn-action" id="btnLsp" title="Analyser les erreurs LSP/TypeScript actuelles">🔴 LSP</button>
+            <button class="btn-action" id="btnLspWatch" title="Surveiller les erreurs en temps réel">👁 Veille</button>
+            <button class="btn-action" id="btnAgent" title="Lancer l'agent autonome IA">🤖 Agent</button>
+            <select id="termPermSelect" title="Permissions terminal IA">
+                <option value="ask-all">💻 Demander toujours</option>
+                <option value="ask-important">⚠️ Demander si important</option>
                 <option value="allow-all">🚀 Autoriser tout</option>
             </select>
         </div>

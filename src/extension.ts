@@ -128,6 +128,26 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     context.subscriptions.push(
+        vscode.commands.registerCommand('local-ai.lspDiagnostics', () => {
+            vscode.commands.executeCommand('local-ai.chatView.focus');
+            setTimeout(() => chatProvider.triggerLspAnalysis('workspace'), 300);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('local-ai.runAgent', async () => {
+            const goal = await vscode.window.showInputBox({
+                prompt: 'Objectif de l\'agent autonome',
+                placeHolder: 'ex: Corrige toutes les erreurs TypeScript du projet',
+                ignoreFocusOut: true,
+            });
+            if (!goal) return;
+            vscode.commands.executeCommand('local-ai.chatView.focus');
+            setTimeout(() => chatProvider.runAgentFromCommand(goal), 300);
+        })
+    );
+
+    context.subscriptions.push(
         vscode.commands.registerCommand('local-ai.addRelatedFiles', async () => {
             const editor = vscode.window.activeTextEditor;
             if (!editor) return;
