@@ -126,6 +126,7 @@ function parseAiResponse(response: string): {
     plan: string | null;
     createFiles: Array<{ name: string; content: string }>;
     projectSummary: string | null;
+    commands: Array<{ cmd: string; isImportant: boolean; badge: string; label: string }>;
 } {
     const needFiles: string[] = [];
     const willModify: string[] = [];
@@ -155,7 +156,19 @@ function parseAiResponse(response: string): {
     const summaryMatch = /\[PROJECT_SUMMARY\]([\s\S]*?)\[\/PROJECT_SUMMARY\]/.exec(response);
     if (summaryMatch) projectSummary = summaryMatch[1].trim();
 
-    return { needFiles, willModify, plan, createFiles, projectSummary };
+    const commands: Array<{ cmd: string; isImportant: boolean; badge: string; label: string }> = [];
+    const cmdRegex = /\[CMD(?:_(IMPORTANT))?:\s*([^\]]+)\]/g;
+    while ((m = cmdRegex.exec(response)) !== null) {
+        const isImportant = !!m[1];
+        commands.push({
+            isImportant,
+            cmd: m[2].trim(),
+            badge: isImportant ? 'important' : 'normal',
+            label: isImportant ? 'CRITIQUE' : 'CMD'
+        });
+    }
+
+    return { needFiles, willModify, plan, createFiles, projectSummary, commands };
 }
 
 function extractMultiFilePatches(response: string): Map<string, string> {
@@ -180,6 +193,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _thinkMode: boolean = false;
     private _currentModel: string = 'llama3';
     private _currentUrl: string = '';
+    private _terminalPermission: 'ask-all' | 'ask-important' | 'allow-all' = 'ask-all';
     private static readonly _previewProvider = new AiPreviewProvider();
     private static _providerRegistered = false;
 
@@ -189,6 +203,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         private readonly _fileCtxManager: FileContextManager,
     ) {
         this._history = this._context.workspaceState.get<ChatMessage[]>('chatHistory', []);
+        this._terminalPermission = this._context.workspaceState.get<'ask-all' | 'ask-important' | 'allow-all'>('terminalPermission', 'ask-all');
         if (!ChatViewProvider._providerRegistered) {
             this._context.subscriptions.push(
                 vscode.workspace.registerTextDocumentContentProvider(
@@ -260,9 +275,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'openFile':
                     if (data.value) await this._handleOpenFile(data.value);
                     break;
-                case 'runCommand':
-                    if (data.value) await this._handleRunCommand(data.value);
-                    break;
                 case 'addRelatedFiles':
                     await this._handleAddRelatedFiles();
                     break;
@@ -290,6 +302,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'getTokenBudget':
                     this._sendTokenBudget();
+                    break;
+                case 'setTerminalPermission':
+                    this._terminalPermission = data.value || 'ask-all';
+                    this._context.workspaceState.update('terminalPermission', this._terminalPermission);
+                    break;
+                case 'getTerminalPermission':
+                    webviewView.webview.postMessage({ type: 'setTerminalPermission', value: this._terminalPermission });
+                    break;
+                case 'runCommand':
+                    if (data.value) await this._handleRunCommand(data.value, data.isImportant === true);
                     break;
             }
         });
@@ -493,6 +515,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         if (parsed.plan) {
             this._view?.webview.postMessage({ type: 'showPlan', plan: parsed.plan });
+        }
+
+        for (const { cmd, isImportant } of parsed.commands) {
+            await this._handleRunCommand(cmd, isImportant);
         }
         const multiPatches = extractMultiFilePatches(response);
         if (multiPatches.size > 1) {
@@ -959,7 +985,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             vscode.window.showInformationMessage(
                 `✅ ${patchCount > 0 ? `${patchCount} patch(s) appliqué(s)` : 'Fichier remplacé'} et sauvegardé !`
             );
+            const summary = this._buildPatchSummary(path.basename(uri.fsPath), oldText, previewText, patchCount);
+            this._view?.webview.postMessage({ type: 'patchSummary', summary });
         }
+    }
+
+    private _buildPatchSummary(fileName: string, oldText: string, newText: string, patchCount: number): string {
+        const oldLines = oldText.split('\n');
+        const newLines = newText.split('\n');
+        let added = 0, removed = 0;
+        const oldSet = new Set(oldLines);
+        const newSet = new Set(newLines);
+        for (const l of newLines) { if (!oldSet.has(l)) added++; }
+        for (const l of oldLines) { if (!newSet.has(l)) removed++; }
+        const delta = newLines.length - oldLines.length;
+        const sign = delta >= 0 ? '+' : '';
+        return `${patchCount} bloc(s) modifié(s) dans **${fileName}** · +${added} / -${removed} lignes (${sign}${delta})`;
     }
 
     private _highlightChangedLines(editor: vscode.TextEditor, oldText: string, newText: string) {
@@ -994,11 +1035,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async _handleRunCommand(cmd: string) {
-        const answer = await vscode.window.showInformationMessage(
-            `Exécuter : ${cmd}`, '🚀 Exécuter', 'Annuler'
-        );
-        if (answer === '🚀 Exécuter') {
+    private async _handleRunCommand(cmd: string, isImportant: boolean = false) {
+        const perm = this._terminalPermission;
+
+        let shouldRun = false;
+
+        if (perm === 'allow-all') {
+            shouldRun = true;
+            this._view?.webview.postMessage({
+                type: 'terminalCommand',
+                cmd,
+                status: 'auto',
+            });
+        } else if (perm === 'ask-important' && !isImportant) {
+            shouldRun = true;
+            this._view?.webview.postMessage({
+                type: 'terminalCommand',
+                cmd,
+                status: 'auto',
+            });
+        } else {
+            const answer = await vscode.window.showInformationMessage(
+                `${isImportant ? '⚠️ Commande importante' : '💻 Terminal'} — Exécuter : \`${cmd}\``,
+                { modal: isImportant },
+                '🚀 Exécuter', '❌ Refuser'
+            );
+            shouldRun = answer === '🚀 Exécuter';
+            this._view?.webview.postMessage({
+                type: 'terminalCommand',
+                cmd,
+                status: shouldRun ? 'accepted' : 'refused',
+            });
+        }
+
+        if (shouldRun) {
             const t = vscode.window.activeTerminal ?? vscode.window.createTerminal('Antigravity AI');
             t.show();
             t.sendText(cmd);
@@ -1057,10 +1127,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "const modelSelect = document.getElementById('modelSelect');",
             "const filesBar = document.getElementById('filesBar');",
             "const tokenBar = document.getElementById('tokenBar');",
+            "const terminalLog = document.getElementById('terminalLog');",
+            "const scrollBtn = document.getElementById('scrollBtn');",
+            "const termPermSelect = document.getElementById('termPermSelect');",
             "let contextFiles = [];",
             "let currentAiMsg = null;",
             "let currentAiText = '';",
             "let thinkModeActive = false;",
+            "let userScrolledUp = false;",
+            "",
+            "// ─── Scroll lock logic ───",
+            "chat.addEventListener('scroll', function() {",
+            "    var threshold = 60;",
+            "    var atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < threshold;",
+            "    userScrolledUp = !atBottom;",
+            "    scrollBtn.style.display = userScrolledUp ? 'flex' : 'none';",
+            "});",
+            "scrollBtn.onclick = function() {",
+            "    chat.scrollTop = chat.scrollHeight;",
+            "    userScrolledUp = false;",
+            "    scrollBtn.style.display = 'none';",
+            "};",
+            "function smartScroll() {",
+            "    if (!userScrolledUp) chat.scrollTop = chat.scrollHeight;",
+            "}",
+            "",
+            "// ─── Terminal permission select ───",
+            "termPermSelect.onchange = function() {",
+            "    vscode.postMessage({ type: 'setTerminalPermission', value: termPermSelect.value });",
+            "};",
             "",
             "// ─── Auto-resize textarea ───",
             "prompt.addEventListener('input', function() {",
@@ -1120,7 +1215,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "    d.className = 'msg ' + cls;",
             "    if (isHtml) { d.innerHTML = txt; } else { d.innerText = txt; }",
             "    chat.appendChild(d);",
-            "    chat.scrollTop = chat.scrollHeight;",
+            "    smartScroll();",
             "    return d;",
             "}",
             "",
@@ -1129,7 +1224,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "    d.className = 'status-msg';",
             "    d.innerText = txt;",
             "    chat.appendChild(d);",
-            "    chat.scrollTop = chat.scrollHeight;",
+            "    smartScroll();",
             "    setTimeout(function() { d.remove(); }, 5000);",
             "}",
             "",
@@ -1311,7 +1406,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "        if (!currentAiMsg) { currentAiMsg = addMsg('', 'ai', true); }",
             "        currentAiText += m.value;",
             "        currentAiMsg.innerHTML = renderMarkdown(currentAiText);",
-            "        chat.scrollTop = chat.scrollHeight;",
+            "        smartScroll();",
             "    }",
             "    if (m.type === 'endResponse') {",
             "        var finalText = m.value || currentAiText;",
@@ -1336,6 +1431,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "        btn.title = m.active ? 'Mode Réflexion ACTIF (cliquer pour désactiver)' : 'Activer le Mode Réflexion';",
             "    }",
             "    if (m.type === 'tokenBudget') { updateTokenBar(m.used, m.max, m.isCloud); }",
+            "    if (m.type === 'patchSummary') {",
+            "        var ps = document.createElement('div');",
+            "        ps.className = 'patch-summary';",
+            "        ps.innerHTML = '✅ ' + renderMarkdown(m.summary);",
+            "        chat.appendChild(ps);",
+            "        smartScroll();",
+            "    }",
+            "    if (m.type === 'terminalCommand') {",
+            "        terminalLog.style.display = 'block';",
+            "        var line = document.createElement('div');",
+            "        line.className = 'cmd-line';",
+            "        var badge = m.status === 'refused' ? 'refused' : (m.status === 'auto' ? 'auto' : 'accepted');",
+            "        var label = m.status === 'refused' ? 'refusé' : (m.status === 'auto' ? 'auto' : 'ok');",
+            "        line.innerHTML = '<span class=\"cmd-badge '+badge+'\">'+label+'</span><span class=\"cmd-text\">$ '+escapeHtml(m.cmd)+'</span>';",
+            "        terminalLog.appendChild(line);",
+            "        terminalLog.scrollTop = terminalLog.scrollHeight;",
+            "        if (terminalLog.children.length > 20) terminalLog.removeChild(terminalLog.firstChild);",
+            "    }",
+            "    if (m.type === 'setTerminalPermission') {",
+            "        termPermSelect.value = m.value || 'ask-all';",
+            "    }",
             "    if (m.type === 'showPlan') {",
             "        var planEl = document.createElement('div');",
             "        planEl.className = 'msg plan-msg';",
@@ -1356,7 +1472,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "",
             "vscode.postMessage({ type: 'getModels' });",
             "vscode.postMessage({ type: 'restoreHistory' });",
-            "vscode.postMessage({ type: 'getTokenBudget' });"
+            "vscode.postMessage({ type: 'getTokenBudget' });",
+            "vscode.postMessage({ type: 'getTerminalPermission' });"
         ].join("\n");
 
         return `<!DOCTYPE html>
@@ -1415,6 +1532,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .thinking span:nth-child(2) { animation-delay: 0.2s; } .thinking span:nth-child(3) { animation-delay: 0.4s; }
         @keyframes bounce { 0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-8px)} }
         button { font-family: 'Inter', sans-serif; }
+        /* ── Patch summary ── */
+        .patch-summary { align-self: flex-start; width: 100%; background: rgba(0,200,100,0.08); border: 1px solid rgba(0,200,100,0.25); border-radius: 10px; padding: 8px 14px; font-size: 11px; color: #6debb0; margin-top: 2px; }
+        .patch-summary b { color: #a0ffcc; }
+        /* ── Terminal log ── */
+        #terminalLog { display: none; background: rgba(0,0,0,0.5); border-top: 1px solid rgba(0,210,255,0.1); padding: 4px 12px; font-family: 'Fira Code', monospace; font-size: 11px; color: #888; max-height: 80px; overflow-y: auto; flex-shrink: 0; }
+        #terminalLog .cmd-line { display: flex; gap: 6px; align-items: center; padding: 2px 0; }
+        #terminalLog .cmd-line .cmd-badge { font-size: 10px; padding: 1px 6px; border-radius: 8px; flex-shrink: 0; }
+        #terminalLog .cmd-line .cmd-badge.accepted { background: rgba(0,200,100,0.2); color: #6debb0; border: 1px solid rgba(0,200,100,0.3); }
+        #terminalLog .cmd-line .cmd-badge.refused { background: rgba(255,80,80,0.15); color: #ff8888; border: 1px solid rgba(255,80,80,0.3); }
+        #terminalLog .cmd-line .cmd-badge.auto { background: rgba(0,210,255,0.15); color: #00d2ff; border: 1px solid rgba(0,210,255,0.25); }
+        #terminalLog .cmd-text { color: #ccc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        /* ── Terminal permission select ── */
+        #termPermSelect { background: rgba(20,20,40,0.8); color: #aaa; border: 1px solid #333; border-radius: 12px; padding: 3px 8px; font-size: 10px; cursor: pointer; outline: none; font-family: 'Inter', sans-serif; }
+        /* ── Scroll-to-bottom FAB ── */
+        #scrollBtn { display: none; position: absolute; bottom: 14px; right: 14px; width: 32px; height: 32px; border-radius: 50%; background: rgba(0,210,255,0.2); border: 1px solid rgba(0,210,255,0.4); color: #00d2ff; font-size: 16px; cursor: pointer; align-items: center; justify-content: center; transition: all 0.2s; z-index: 10; }
+        #scrollBtn:hover { background: rgba(0,210,255,0.35); }
+        #chatWrap { flex: 1; position: relative; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
     </style>
 </head>
 <body>
@@ -1429,7 +1563,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div id="localWarn"></div>
     <div id="tokenBar"></div>
     <div id="filesBar"></div>
-    <div id="chat"></div>
+    <div id="chatWrap">
+        <div id="chat"></div>
+        <button id="scrollBtn" title="Retour en bas">↓</button>
+    </div>
+    <div id="terminalLog"></div>
     <div class="input-area">
         <div class="input-actions">
             <button class="btn-action" id="btnAddFile" title="Ajouter un fichier au contexte">📎 Fichier</button>
@@ -1440,6 +1578,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             <button class="btn-action" id="btnCommit" title="Générer un message de commit">💾 Commit</button>
             <button class="btn-action" id="btnTests" title="Générer les tests du fichier actif">🧪 Tests</button>
             <button class="btn-action" id="btnClearHistory" title="Effacer l'historique">🗑 Vider</button>
+            <select id="termPermSelect" title="Permissions terminal IA">
+                <option value="ask-all">💻 Demander toujours</option>
+                <option value="ask-important">⚠️ Demander si important</option>
+                <option value="allow-all">🚀 Autoriser tout</option>
+            </select>
         </div>
         <div class="input-row">
             <textarea id="prompt" placeholder="Posez une question… (Entrée pour envoyer, Shift+Entrée pour saut de ligne)" rows="1"></textarea>

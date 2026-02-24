@@ -175,7 +175,7 @@ export class OllamaClient {
         const updated = keys.map(k => {
             if (k.key === keyValue && k.url === url) {
                 changed = true;
-                return { ...k, rateLimitedUntil: now + 60_000 }; // 60s de cooldown
+                return { ...k, rateLimitedUntil: now + 60_000 };
             }
             return k;
         });
@@ -386,6 +386,7 @@ export class OllamaClient {
 - Modifie UNIQUEMENT le vrai code fourni dans le contexte.
 - Style robotique : PAS de salutations, PAS d'explications inutiles. Fournis directement le correctif.
 - Si tu as besoin d'accéder à un fichier qui n'est PAS dans ton contexte, indique-le EXPLICITEMENT avec la balise : [NEED_FILE: chemin/du/fichier]
+- Pour suggérer une commande terminal, utilise : [CMD: commande] (ex: [CMD: npm install]). Pour une commande destructive ou risquée : [CMD_IMPORTANT: commande] (ex: [CMD_IMPORTANT: rm -rf dist]). L'utilisateur sera toujours consulté avant exécution selon ses préférences.
 - Si tu identifies plusieurs fichiers à modifier, liste-les TOUS avant de commencer avec : [WILL_MODIFY: fichier1, fichier2, ...]
 - Pour le mode "Réflexion", commence par un bloc [PLAN] qui liste toutes les modifications envisagées avant tout code.
 
