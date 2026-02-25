@@ -2,7 +2,7 @@
   "name": "local-ai-integration",
   "displayName": "Local AI Integration",
   "description": "Integrate local AI models (Ollama) into VS Code with project context.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "antigravity",
   "icon": "media/icon.png",
   "engines": {
