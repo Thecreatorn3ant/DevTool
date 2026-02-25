@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { OllamaClient, ContextFile } from './ollamaClient';
+import { SelectedSlot } from './providerRouter';
 import { FileContextManager } from './fileContextManager';
 import { LspDiagnosticsManager } from './lspDiagnosticsManager';
 
@@ -31,6 +32,8 @@ export interface AgentSession {
     startedAt: number;
     model: string;
     url: string;
+    activeSlot: SelectedSlot | null;
+    keyRotations: number;
 }
 
 type AgentEventType = 'step_start' | 'step_done' | 'step_failed' | 'session_done' | 'session_failed' | 'log';
@@ -81,7 +84,7 @@ export class AgentRunner {
         private readonly _fileCtxManager: FileContextManager,
         private readonly _lspManager: LspDiagnosticsManager,
         private readonly _context: vscode.ExtensionContext,
-    ) {}
+    ) { }
 
     onEvent(handler: (event: AgentEvent) => void) {
         this._onEvent = handler;
@@ -106,9 +109,14 @@ export class AgentRunner {
         goal: string,
         model: string,
         url: string,
-        initialContext: ContextFile[] = []
+        initialContext: ContextFile[] = [],
+        preferredApiKey: string = ''
     ): Promise<AgentSession> {
         this._stopped = false;
+
+        let activeSlot: SelectedSlot = await this._ollamaClient.router.selectProvider(
+            'agent', url, false, preferredApiKey
+        );
 
         const session: AgentSession = {
             id: Date.now().toString(),
@@ -117,41 +125,32 @@ export class AgentRunner {
             status: 'running',
             startedAt: Date.now(),
             model,
-            url,
+            url: activeSlot.url,
+            activeSlot,
+            keyRotations: 0,
         };
         this._currentSession = session;
 
-        const contextParts: string[] = [
-            `[OBJECTIF] ${goal}`,
-            '',
-        ];
-
+        const contextParts: string[] = [`[OBJECTIF] ${goal}`, ''];
         const tree = await this._fileCtxManager.getWorkspaceTree();
         contextParts.push('[STRUCTURE DU PROJET]');
         contextParts.push(tree.slice(0, 80).join('\n'));
         contextParts.push('');
-
         for (const f of initialContext.slice(0, 5)) {
             contextParts.push(`[FICHIER: ${f.name}]\n${f.content.substring(0, 3000)}`);
         }
-
         const diags = this._lspManager.getSnapshot('errors-only');
         if (diags.errorCount > 0) {
             contextParts.push('');
             contextParts.push(this._lspManager.formatForPrompt(diags));
         }
-
         const agentContext = contextParts.join('\n');
-
         const agentHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
 
-        this._emit({ type: 'log', session, message: `🤖 Agent démarré — Objectif : ${goal}` });
+        this._emit({ type: 'log', session, message: `🤖 Agent démarré — Objectif : ${goal} (slot: ${activeSlot.name})` });
 
         for (let stepIdx = 0; stepIdx < MAX_STEPS; stepIdx++) {
-            if (this._stopped) {
-                session.status = 'stopped';
-                break;
-            }
+            if (this._stopped) { session.status = 'stopped'; break; }
 
             const step: AgentStep = {
                 id: stepIdx,
@@ -171,17 +170,22 @@ export class AgentRunner {
                 ? `Contexte:\n${agentContext}\n\nCommence à accomplir l'objectif. Réponds avec le JSON de ta première action.`
                 : `Continue. Historique des ${agentHistory.length} dernières actions:\n${historyStr}\n\nProchaine action JSON :`;
 
+            // ── Per-step LLM call with slot-aware retry ────────────────────────
             let rawResponse = '';
             try {
                 const timeoutPromise = new Promise<never>((_, reject) =>
                     setTimeout(() => reject(new Error('Timeout')), STEP_TIMEOUT_MS)
                 );
                 const t0 = Date.now();
+
                 rawResponse = await Promise.race([
-                    this._ollamaClient.generateResponse(stepPrompt, AGENT_SYSTEM_PROMPT, model, url || undefined),
+                    this._callWithSlotRetry(stepPrompt, model, activeSlot, session, step),
                     timeoutPromise,
                 ]);
+
+                activeSlot = session.activeSlot!;
                 step.durationMs = Date.now() - t0;
+
             } catch (e: any) {
                 step.status = 'failed';
                 step.output = e.message;
@@ -193,23 +197,16 @@ export class AgentRunner {
             let action: any;
             try {
                 const cleaned = rawResponse
-                    .replace(/^```json\s*/i, '')
-                    .replace(/^```\s*/i, '')
-                    .replace(/```\s*$/i, '')
-                    .trim();
+                    .replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
                 action = JSON.parse(cleaned);
             } catch {
                 const match = rawResponse.match(/\{[\s\S]*\}/);
-                if (match) {
-                    try { action = JSON.parse(match[0]); } catch { /* noop */ }
-                }
+                if (match) { try { action = JSON.parse(match[0]); } catch { /* noop */ } }
                 if (!action) {
-                    step.type = 'error';
-                    step.status = 'failed';
+                    step.type = 'error'; step.status = 'failed';
                     step.output = `Réponse non-JSON : ${rawResponse.substring(0, 200)}`;
                     this._emit({ type: 'step_failed', session, step });
-                    session.status = 'failed';
-                    break;
+                    session.status = 'failed'; break;
                 }
             }
 
@@ -223,7 +220,6 @@ export class AgentRunner {
 
             agentHistory.push({ role: 'user', content: stepPrompt });
             agentHistory.push({ role: 'assistant', content: rawResponse });
-
             if (result.feedback) {
                 agentHistory.push({ role: 'user', content: `[RÉSULTAT] ${result.feedback}` });
             }
@@ -235,13 +231,11 @@ export class AgentRunner {
                 this._emit({ type: 'session_done', session, message: action.input });
                 break;
             }
-
             if (action.type === 'error') {
                 session.status = 'failed';
                 this._emit({ type: 'session_failed', session, message: action.input });
                 break;
             }
-
             if (!result.success) {
                 agentHistory.push({ role: 'user', content: `[ERREUR] ${result.output} — Continue ou utilise "error" si bloqué.` });
             }
@@ -251,8 +245,51 @@ export class AgentRunner {
             session.status = 'done';
             this._emit({ type: 'session_done', session, message: 'Limite d\'étapes atteinte.' });
         }
-
+        if (session.keyRotations > 0) {
+            this._emit({ type: 'log', session, message: `🔑 ${session.keyRotations} rotation(s) de clé effectuée(s) durant la session.` });
+        }
         return session;
+    }
+
+    private async _callWithSlotRetry(
+        prompt: string,
+        model: string,
+        slot: SelectedSlot,
+        session: AgentSession,
+        step: AgentStep,
+        attempt: number = 0
+    ): Promise<string> {
+        try {
+            return await this._ollamaClient.generateResponse(
+                prompt, '', model, slot.url, undefined, slot.apiKey
+            );
+        } catch (e: any) {
+            const msg: string = e.message || '';
+            const isRateLimit = msg.includes('rate limit') || msg.includes('429') || msg.includes('quota');
+
+            if (isRateLimit && attempt < 3) {
+                try {
+                    const nextSlot = await this._ollamaClient.router.selectProvider(
+                        'agent', slot.url, false, slot.apiKey
+                    );
+                    const rotated = nextSlot.url !== slot.url || nextSlot.apiKey !== slot.apiKey;
+                    if (rotated) {
+                        session.activeSlot = nextSlot;
+                        session.keyRotations++;
+                        const rotMsg = nextSlot.url === slot.url
+                            ? `🔑 Clé ${slot.name} épuisée → bascule sur ${nextSlot.name} (même provider, step ${step.id})`
+                            : `🔄 Provider épuisé → bascule sur ${nextSlot.name} (step ${step.id})`;
+                        this._emit({ type: 'log', session, step, message: rotMsg });
+                        return this._callWithSlotRetry(prompt, model, nextSlot, session, step, attempt + 1);
+                    }
+                } catch { /* no available slot */ }
+
+                await new Promise(r => setTimeout(r, 3000 * (attempt + 1)));
+                return this._callWithSlotRetry(prompt, model, slot, session, step, attempt + 1);
+            }
+
+            throw e;
+        }
     }
 
     private async _executeAction(

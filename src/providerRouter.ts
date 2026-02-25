@@ -2,7 +2,53 @@ import * as vscode from 'vscode';
 
 export type TaskType = 'chat' | 'code' | 'vision' | 'commit' | 'agent';
 
-const SUSPENSION_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+export type RateLimitTier = 'session' | 'weekly' | 'suspended';
+
+interface ProviderQuotaProfile {
+    sessionThresholdMs: number;
+    suspensionThresholdMs: number;
+    quotaDescription: string;
+}
+
+const QUOTA_PROFILES: Record<string, ProviderQuotaProfile> = {
+    'ollama-cloud': {
+        sessionThresholdMs: 5 * 60 * 60 * 1000,
+        suspensionThresholdMs: 4 * 24 * 60 * 60 * 1000,
+        quotaDescription: 'Session (~5h) + quota hebdomadaire',
+    },
+    'gemini': {
+        sessionThresholdMs: 60 * 60 * 1000,
+        suspensionThresholdMs: 24 * 60 * 60 * 1000,
+        quotaDescription: 'Quota journalier',
+    },
+    'groq': {
+        sessionThresholdMs: 60 * 60 * 1000,
+        suspensionThresholdMs: 24 * 60 * 60 * 1000,
+        quotaDescription: 'Quota journalier',
+    },
+    'openrouter': {
+        sessionThresholdMs: 30 * 60 * 1000,
+        suspensionThresholdMs: 24 * 60 * 60 * 1000,
+        quotaDescription: 'Quota journalier / crédits',
+    },
+    '_default': {
+        sessionThresholdMs: 60 * 60 * 1000,
+        suspensionThresholdMs: 24 * 60 * 60 * 1000,
+        quotaDescription: 'Quota journalier',
+    },
+};
+
+function getQuotaProfile(provider: string): ProviderQuotaProfile {
+    return QUOTA_PROFILES[provider] ?? QUOTA_PROFILES['_default'];
+}
+
+function classifyRateLimit(provider: string, cooldownMs: number): RateLimitTier {
+    const profile = getQuotaProfile(provider);
+    if (cooldownMs >= profile.suspensionThresholdMs) return 'suspended';
+    if (cooldownMs >= profile.sessionThresholdMs) return 'weekly';
+    return 'session';
+}
+
 const FAILOVER_PRIORITY: string[] = ['local', 'openrouter', 'groq', 'mistral', 'together', 'openai', 'anthropic', 'ollama-cloud'];
 
 export interface ProviderCapabilities {
@@ -14,10 +60,13 @@ export interface ProviderCapabilities {
 
 export interface ProviderHealth {
     url: string;
+    apiKey: string;
     name: string;
     provider: string;
     available: boolean;
     suspended: boolean;
+    rateLimitTier: RateLimitTier;
+    sessionHits: number;
     latencyMs: number;
     errorRate: number;
     rateLimitedUntil: number;
@@ -41,18 +90,30 @@ export interface RouterStats {
 export interface QueuedRequest {
     id: string;
     task: TaskType;
-    resolve: (providerUrl: string) => void;
+    resolve: (slot: SelectedSlot) => void;
     reject: (err: Error) => void;
     createdAt: number;
     timeoutMs: number;
+}
+
+export interface SelectedSlot {
+    url: string;
+    apiKey: string;
+    name: string;
+    provider: string;
 }
 
 export interface ProviderSuspendedEvent {
     url: string;
     name: string;
     provider: string;
+    tier: RateLimitTier;
     rateLimitedUntil: number;
     cooldownHours: number;
+    sessionHits: number;
+    quotaDescription: string;
+    exhaustedKeys: string[];
+    remainingKeys: string[];
     failoverUrl: string | null;
     failoverName: string | null;
 }
@@ -78,6 +139,7 @@ export const FREE_MODELS: Record<string, string[]> = {
 
 export class ProviderRouter {
     private _health = new Map<string, ProviderHealth>();
+    private _fullKeys = new Map<string, string>();
     private _queue: QueuedRequest[] = [];
     private _queueTimer?: NodeJS.Timeout;
     private _forcedLocalActive = false;
@@ -94,15 +156,19 @@ export class ProviderRouter {
     private _onStatsChanged?: (stats: RouterStats) => void;
     private _onProviderSuspended?: (event: ProviderSuspendedEvent) => void;
 
-    registerProvider(url: string, name: string, provider: string, apiKey?: string) {
-        const key = this._urlKey(url);
-        if (!this._health.has(key)) {
-            this._health.set(key, {
+    registerProvider(url: string, name: string, provider: string, apiKey: string = '') {
+        const slot = this._slotKey(url, apiKey);
+        this._fullKeys.set(slot, apiKey);
+        if (!this._health.has(slot)) {
+            this._health.set(slot, {
                 url,
+                apiKey: this._keyHint(apiKey),
                 name,
                 provider,
                 available: true,
                 suspended: false,
+                rateLimitTier: 'session',
+                sessionHits: 0,
                 latencyMs: 0,
                 errorRate: 0,
                 rateLimitedUntil: 0,
@@ -116,7 +182,10 @@ export class ProviderRouter {
         this._syncStats();
     }
 
-    unregisterProvider(url: string) {
+    unregisterProvider(url: string, apiKey: string = '') {
+        const slot = this._slotKey(url, apiKey);
+        this._health.delete(slot);
+        this._fullKeys.delete(slot);
         this._health.delete(this._urlKey(url));
         this._syncStats();
     }
@@ -124,40 +193,64 @@ export class ProviderRouter {
     async selectProvider(
         task: TaskType,
         preferredUrl?: string,
-        requireVision: boolean = false
-    ): Promise<string> {
+        requireVision: boolean = false,
+        preferredApiKey: string = ''
+    ): Promise<SelectedSlot> {
         this._stats.totalRequests++;
 
         if (this._forcedLocalActive) {
             const local = this._findLocalProvider();
-            if (local) return local.url;
+            if (local) return this._slotToSelected(local);
         }
 
         const now = Date.now();
-        const candidates = Array.from(this._health.values())
-            .filter(h => {
-                if (h.suspended) return false;
-                if (h.rateLimitedUntil > now) return false;
-                if (!h.available) return false;
-                if (requireVision && !h.capabilities.vision) return false;
-                return true;
-            });
+        const allSlots = Array.from(this._health.values());
+        const available = allSlots.filter(h =>
+            !h.suspended &&
+            h.rateLimitedUntil <= now &&
+            h.available &&
+            (!requireVision || h.capabilities.vision)
+        );
 
-        if (candidates.length === 0) {
+        if (available.length === 0) {
             return this._enqueueRequest(task, requireVision);
         }
 
         if (preferredUrl) {
-            const preferred = candidates.find(c => this._urlKey(c.url) === this._urlKey(preferredUrl));
-            if (preferred) return preferred.url;
+            const prefSlot = this._slotKey(preferredUrl, preferredApiKey);
+            const exact = available.find(h => this._slotKey(h.url, this._fullKeys.get(this._slotKey(h.url, h.apiKey)) ?? '') === prefSlot);
+            if (exact) return this._slotToSelected(exact);
+
+            const preferredProvider = allSlots.find(h =>
+                this._urlKey(h.url) === this._urlKey(preferredUrl)
+            )?.provider;
+
+            if (preferredProvider) {
+                const sameType = available
+                    .filter(h => h.provider === preferredProvider)
+                    .sort((a, b) => this._score(b, task) - this._score(a, task));
+
+                if (sameType.length > 0) {
+                    this._stats.totalFailovers++;
+                    return this._slotToSelected(sameType[0]);
+                }
+            }
+
             this._stats.totalFailovers++;
         }
 
-        const scored = candidates
-            .map(h => ({ h, score: this._score(h, task) }))
-            .sort((a, b) => b.score - a.score);
+        const best = available.sort((a, b) => this._score(b, task) - this._score(a, task))[0];
+        return this._slotToSelected(best);
+    }
 
-        return scored[0].h.url;
+    private _slotToSelected(h: ProviderHealth): SelectedSlot {
+        const slot = this._slotKey(h.url, h.apiKey);
+        return {
+            url: h.url,
+            apiKey: this._fullKeys.get(slot) ?? '',
+            name: h.name,
+            provider: h.provider,
+        };
     }
 
     private _score(h: ProviderHealth, task: TaskType): number {
@@ -171,8 +264,9 @@ export class ProviderRouter {
         return score;
     }
 
-    reportSuccess(url: string, latencyMs: number, tokensUsed: number = 0) {
-        const h = this._health.get(this._urlKey(url));
+
+    reportSuccess(url: string, latencyMs: number, tokensUsed: number = 0, apiKey: string = '') {
+        const h = this._health.get(this._slotKey(url, apiKey));
         if (!h) return;
         h.latencyMs = Math.round((h.latencyMs * 0.8) + (latencyMs * 0.2));
         h.totalRequests++;
@@ -184,8 +278,8 @@ export class ProviderRouter {
         this._drainQueue();
     }
 
-    reportError(url: string, isRateLimit: boolean = false, cooldownMs: number = 60_000) {
-        const h = this._health.get(this._urlKey(url));
+    reportError(url: string, isRateLimit: boolean = false, cooldownMs: number = 60_000, apiKey: string = '') {
+        const h = this._health.get(this._slotKey(url, apiKey));
         if (!h) return;
         h.totalRequests++;
         h.totalErrors++;
@@ -195,7 +289,7 @@ export class ProviderRouter {
         if (isRateLimit) {
             h.rateLimitedUntil = Date.now() + cooldownMs;
             h.available = true;
-            this._checkSuspension(h, cooldownMs);
+            this._checkRateLimitTier(h, cooldownMs);
         } else if (h.errorRate > 0.6) {
             h.available = false;
         }
@@ -204,35 +298,78 @@ export class ProviderRouter {
         this._syncStats();
     }
 
-    reportRateLimit(url: string, retryAfterMs?: number) {
-        this.reportError(url, true, retryAfterMs ?? 60_000);
+    reportRateLimit(url: string, retryAfterMs?: number, apiKey: string = '') {
+        this.reportError(url, true, retryAfterMs ?? 60_000, apiKey);
     }
 
-    setAvailable(url: string, available: boolean) {
-        const h = this._health.get(this._urlKey(url));
+    setAvailable(url: string, available: boolean, apiKey: string = '') {
+        const h = this._health.get(this._slotKey(url, apiKey));
         if (h) {
             h.available = available;
-            if (available) h.suspended = false;
+            if (available) {
+                h.suspended = false;
+                h.rateLimitTier = 'session';
+            }
             this._syncStats();
         }
     }
 
-    private _checkSuspension(h: ProviderHealth, cooldownMs: number) {
-        if (cooldownMs < SUSPENSION_THRESHOLD_MS) return;
-        if (h.suspended) return;
+    private _checkRateLimitTier(h: ProviderHealth, cooldownMs: number) {
+        const tier = classifyRateLimit(h.provider, cooldownMs);
+        const profile = getQuotaProfile(h.provider);
+        h.rateLimitTier = tier;
 
-        h.suspended = true;
-        this._stats.totalSuspensions++;
+        if (tier === 'session') {
+            h.sessionHits++;
+            return;
+        }
 
-        const cooldownHours = Math.ceil(cooldownMs / (60 * 60 * 1000));
+        if (h.suspended && tier === 'suspended') return;
+
+        if (tier === 'suspended') {
+            h.suspended = true;
+            this._stats.totalSuspensions++;
+        }
+
+        const now = Date.now();
+        const allSlots = Array.from(this._health.values());
+
+        const siblings = allSlots.filter(s =>
+            s.provider === h.provider &&
+            this._slotKey(s.url, s.apiKey) !== this._slotKey(h.url, h.apiKey)
+        );
+
+        const availableSiblings = siblings.filter(s =>
+            !s.suspended &&
+            s.rateLimitedUntil <= now &&
+            s.available
+        );
+
+        if (availableSiblings.length > 0) {
+            return;
+        }
+
+        const exhaustedKeys = siblings
+            .filter(s => s.rateLimitedUntil > now || s.suspended)
+            .map(s => `${s.name} (${s.apiKey})`);
+        exhaustedKeys.unshift(`${h.name} (${h.apiKey})`);
+
+        const remainingKeys: string[] = [];
+
         const failover = this._findBestFailover(h.provider);
+        const cooldownHours = Math.ceil(cooldownMs / (60 * 60 * 1000));
 
         const event: ProviderSuspendedEvent = {
             url: h.url,
             name: h.name,
             provider: h.provider,
+            tier,
             rateLimitedUntil: h.rateLimitedUntil,
             cooldownHours,
+            sessionHits: h.sessionHits,
+            quotaDescription: profile.quotaDescription,
+            exhaustedKeys,
+            remainingKeys,
             failoverUrl: failover?.url ?? null,
             failoverName: failover?.name ?? null,
         };
@@ -241,19 +378,21 @@ export class ProviderRouter {
         this._syncStats();
     }
 
-    liftSuspension(url: string) {
-        const h = this._health.get(this._urlKey(url));
+    liftSuspension(url: string, apiKey: string = '') {
+        const h = this._health.get(this._slotKey(url, apiKey));
         if (!h) return;
         h.suspended = false;
+        h.rateLimitTier = 'session';
         h.rateLimitedUntil = 0;
+        h.sessionHits = 0;
         h.available = true;
         h.errorRate = Math.max(0, h.errorRate - 0.3);
         this._syncStats();
         this._drainQueue();
     }
 
-    isSuspended(url: string): boolean {
-        const h = this._health.get(this._urlKey(url));
+    isSuspended(url: string, apiKey: string = ''): boolean {
+        const h = this._health.get(this._slotKey(url, apiKey));
         return h?.suspended ?? false;
     }
 
@@ -263,12 +402,20 @@ export class ProviderRouter {
 
     getSuspendedProviders(): ProviderHealth[] {
         const now = Date.now();
-        return Array.from(this._health.values())
-            .filter(h => h.suspended)
-            .map(h => ({
-                ...h,
-                _remainingMs: Math.max(0, h.rateLimitedUntil - now),
-            })) as ProviderHealth[];
+        return Array.from(this._health.values()).filter(h =>
+            h.suspended || h.rateLimitedUntil > now
+        );
+    }
+
+    getProviderKeyStats(providerType: string): { total: number; available: number; exhausted: number } {
+        const now = Date.now();
+        const slots = Array.from(this._health.values()).filter(h => h.provider === providerType);
+        const available = slots.filter(h => !h.suspended && h.rateLimitedUntil <= now && h.available);
+        return {
+            total: slots.length,
+            available: available.length,
+            exhausted: slots.length - available.length,
+        };
     }
 
     forceLocal(active: boolean = true): { success: boolean; message: string } {
@@ -297,13 +444,11 @@ export class ProviderRouter {
         return this._forcedLocalActive;
     }
 
-    triggerFailover(url: string, cooldownMs = SUSPENSION_THRESHOLD_MS): ProviderHealth | null {
-        const h = this._health.get(this._urlKey(url));
+    triggerFailover(url: string, cooldownMs = 4 * 24 * 60 * 60 * 1000, apiKey: string = ''): ProviderHealth | null {
+        const h = this._health.get(this._slotKey(url, apiKey));
         if (!h) return null;
-
         h.rateLimitedUntil = Date.now() + cooldownMs;
-        this._checkSuspension(h, cooldownMs);
-
+        this._checkRateLimitTier(h, cooldownMs);
         return this._findBestFailover(h.provider);
     }
 
@@ -360,8 +505,8 @@ export class ProviderRouter {
         return { ...this._stats };
     }
 
-    getProviderHealth(url: string): ProviderHealth | undefined {
-        return this._health.get(this._urlKey(url));
+    getProviderHealth(url: string, apiKey: string = ''): ProviderHealth | undefined {
+        return this._health.get(this._slotKey(url, apiKey));
     }
 
     getAllHealth(): ProviderHealth[] {
@@ -374,17 +519,21 @@ export class ProviderRouter {
             .filter(h => h.rateLimitedUntil > now)
             .map(h => {
                 const remainMs = h.rateLimitedUntil - now;
-                const label = h.suspended ? '🔴 suspendu' : '🟡 cooldown';
-                const time = remainMs >= 3_600_000
-                    ? `${Math.ceil(remainMs / 3_600_000)}h`
-                    : `${Math.ceil(remainMs / 1000)}s`;
-                return `${h.name}: ${time} (${label})`;
+                const time = remainMs >= 24 * 3_600_000
+                    ? `${Math.ceil(remainMs / (24 * 3_600_000))}j`
+                    : remainMs >= 3_600_000
+                        ? `${Math.ceil(remainMs / 3_600_000)}h`
+                        : `${Math.ceil(remainMs / 1000)}s`;
+                const tierLabel =
+                    h.rateLimitTier === 'suspended' ? '🔴 suspendu' :
+                        h.rateLimitTier === 'weekly' ? '🟠 quota semaine' :
+                            '🟡 session';
+                return `${h.name}: ${time} (${tierLabel})`;
             });
         return cooled.length > 0 ? cooled.join(', ') : 'Aucun cooldown actif';
     }
 
-
-    private _enqueueRequest(task: TaskType, requireVision: boolean): Promise<string> {
+    private _enqueueRequest(task: TaskType, requireVision: boolean): Promise<SelectedSlot> {
         return new Promise((resolve, reject) => {
             const id = `req_${Date.now()}_${Math.random().toString(36).slice(2)}`;
             const entry: QueuedRequest = {
@@ -428,12 +577,11 @@ export class ProviderRouter {
         if (next) {
             this._stats.queueLength = this._queue.length;
             this._syncStats();
-            next.resolve(best.url);
+            next.resolve(this._slotToSelected(best));
         }
     }
 
-
-    async pingProvider(url: string, apiKey?: string): Promise<{ ok: boolean; latencyMs: number }> {
+    async pingProvider(url: string, apiKey: string = ''): Promise<{ ok: boolean; latencyMs: number }> {
         const t0 = Date.now();
         const isOpenAI = url.includes('together') || url.includes('openrouter') || url.endsWith('/v1');
         const isGemini = url.includes('generativelanguage.googleapis.com');
@@ -444,24 +592,43 @@ export class ProviderRouter {
             if (apiKey && !isGemini) headers['Authorization'] = `Bearer ${apiKey}`;
             const res = await fetch(endpoint, { headers, signal: AbortSignal.timeout(4000) });
             const latencyMs = Date.now() - t0;
-            const h = this._health.get(this._urlKey(url));
+            const h = this._health.get(this._slotKey(url, apiKey));
             if (h) {
                 h.latencyMs = latencyMs;
-                if (res.ok && !h.suspended) h.available = true;
-                if (res.ok && h.suspended) {
+                if (res.ok) {
                     h.suspended = false;
                     h.rateLimitedUntil = 0;
                     h.available = true;
+                    h.rateLimitTier = 'session';
+                } else {
+                    h.available = false;
                 }
                 h.lastChecked = Date.now();
                 this._syncStats();
             }
             return { ok: res.ok, latencyMs };
         } catch {
-            const h = this._health.get(this._urlKey(url));
+            const h = this._health.get(this._slotKey(url, apiKey));
             if (h) { h.available = false; h.lastChecked = Date.now(); this._syncStats(); }
             return { ok: false, latencyMs: Date.now() - t0 };
         }
+    }
+
+    private _slotKey(url: string, apiKey: string = ''): string {
+        const normalUrl = (url || '').replace(/\/+$/, '').toLowerCase();
+        const keyFragment = apiKey ? apiKey.substring(0, 8).toLowerCase() : '';
+        return keyFragment ? `${normalUrl}||${keyFragment}` : normalUrl;
+    }
+
+    private _keyHint(apiKey: string): string {
+        if (!apiKey) return '';
+        return apiKey.length > 8
+            ? `${apiKey.substring(0, 4)}…${apiKey.slice(-4)}`
+            : `${apiKey.substring(0, 4)}…`;
+    }
+
+    private _urlKey(url: string): string {
+        return (url || '').replace(/\/+$/, '').toLowerCase();
     }
 
     private _syncStats() {
@@ -470,10 +637,6 @@ export class ProviderRouter {
         this._stats.lastUpdated = Date.now();
         this._stats.forcedLocalActive = this._forcedLocalActive;
         this._onStatsChanged?.(this.getStats());
-    }
-
-    private _urlKey(url: string): string {
-        return (url || '').replace(/\/+$/, '').toLowerCase();
     }
 
     dispose() {

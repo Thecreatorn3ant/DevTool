@@ -122,7 +122,7 @@ export class OllamaClient {
             const provider = this._detectProvider(entry.url);
             this.router.registerProvider(entry.url, entry.name, provider, entry.key);
             if (entry.rateLimitedUntil && entry.rateLimitedUntil > Date.now()) {
-                this.router.reportRateLimit(entry.url, entry.rateLimitedUntil - Date.now());
+                this.router.reportRateLimit(entry.url, entry.rateLimitedUntil - Date.now(), entry.key);
             }
         }
     }
@@ -173,7 +173,8 @@ export class OllamaClient {
         if (idx === -1) return;
         delete keys[idx].rateLimitedUntil;
         await this._saveApiKeys(keys);
-        this.router.setAvailable(url, true);
+        this.router.setAvailable(url, true, keyValue);
+        this.router.liftSuspension(url, keyValue);
     }
 
     getApiKeyStatuses(): ApiKeyStatus[] {
@@ -282,25 +283,24 @@ export class OllamaClient {
         modelOverride?: string,
         targetUrl?: string,
         images?: AttachedImage[],
-        taskType: TaskType = 'chat'
+        taskType: TaskType = 'chat',
+        preferredApiKey: string = ''
     ): Promise<string> {
         const hasImages = images && images.length > 0;
-        let url = targetUrl || this._getBaseUrl();
-        if (hasImages) {
-            try {
-                url = await this.router.selectProvider(taskType, url, true /* requireVision */);
-            } catch {
-            }
-        }
-
         const config = this._getConfig();
         const model = modelOverride || config.get<string>('defaultModel') || 'llama3';
-
         const fullPrompt = context
             ? `Contexte du projet:\n${context}\n\n---\nQuestion: ${prompt}`
             : prompt;
 
-        return await this._doRequestWithRetry(url, model, fullPrompt, onUpdate, 0, images, taskType);
+        let slot = await this.router.selectProvider(
+            taskType,
+            targetUrl,
+            hasImages ?? false,
+            preferredApiKey
+        );
+
+        return this._doRequestWithRetry(slot, model, fullPrompt, onUpdate, 0, images, taskType);
     }
 
     async generateResponse(
@@ -308,15 +308,19 @@ export class OllamaClient {
         context: string = '',
         modelOverride?: string,
         targetUrl?: string,
-        images?: AttachedImage[]
+        images?: AttachedImage[],
+        preferredApiKey: string = ''
     ): Promise<string> {
         let full = '';
-        await this.generateStreamingResponse(prompt, context, (c) => { full += c; }, modelOverride, targetUrl, images);
+        await this.generateStreamingResponse(
+            prompt, context, (c) => { full += c; },
+            modelOverride, targetUrl, images, 'chat', preferredApiKey
+        );
         return full;
     }
 
     private async _doRequestWithRetry(
-        url: string,
+        slot: import('./providerRouter').SelectedSlot,
         model: string,
         fullPrompt: string,
         onUpdate: (chunk: string) => void,
@@ -324,7 +328,7 @@ export class OllamaClient {
         images?: AttachedImage[],
         taskType: TaskType = 'chat'
     ): Promise<string> {
-        const { key: apiKey, entry: keyEntry } = this._getAvailableKey(url);
+        const { url, apiKey, name: slotName } = slot;
         const isOpenAI = this._isOpenAI(url);
         const isGemini = this._isGemini(url);
         const systemPrompt = this._getSystemPrompt();
@@ -347,9 +351,7 @@ export class OllamaClient {
                 const parts: any[] = [{ text: systemPrompt + '\n\n' + fullPrompt }];
                 if (hasImages) {
                     for (const img of images!) {
-                        parts.unshift({
-                            inlineData: { mimeType: img.mimeType, data: img.base64 }
-                        });
+                        parts.unshift({ inlineData: { mimeType: img.mimeType, data: img.base64 } });
                     }
                 }
                 reqBody = { contents: [{ role: 'user', parts }] };
@@ -393,37 +395,39 @@ export class OllamaClient {
             });
 
             if (response.status === 429) {
-                if (apiKey && keyEntry) {
-                    await this._markKeyAsRateLimited(apiKey, keyEntry.url);
-                    vscode.window.showWarningMessage(
-                        `⏳ Rate Limit — "${keyEntry.name}" en cooldown 60s. Bascule automatique...`
-                    );
-                }
-                this.router.reportRateLimit(url);
+                const retryAfterSec = parseInt(response.headers.get('retry-after') || '60', 10);
+                const cooldownMs = (isNaN(retryAfterSec) ? 60 : retryAfterSec) * 1000;
+
+                await this._markKeyAsRateLimited(apiKey, url, cooldownMs);
+                this.router.reportRateLimit(url, cooldownMs, apiKey);
 
                 if (attempt < 4) {
                     try {
-                        const nextUrl = await this.router.selectProvider(taskType, undefined, hasImages ?? false);
-                        if (nextUrl !== url) {
-                            vscode.window.showInformationMessage(`🔄 Failover → ${this._detectProvider(nextUrl)}`);
-                            return this._doRequestWithRetry(nextUrl, model, fullPrompt, onUpdate, attempt + 1, images, taskType);
+                        const nextSlot = await this.router.selectProvider(taskType, url, hasImages ?? false, apiKey);
+                        const isSameSlot = nextSlot.url === url && nextSlot.apiKey === apiKey;
+                        if (!isSameSlot) {
+                            const switchMsg = nextSlot.url === url
+                                ? `🔄 Clé épuisée — bascule sur ${nextSlot.name} (même provider)`
+                                : `🔄 Failover → ${nextSlot.name} (${this._detectProvider(nextSlot.url)})`;
+                            vscode.window.showInformationMessage(switchMsg);
+                            return this._doRequestWithRetry(nextSlot, model, fullPrompt, onUpdate, attempt + 1, images, taskType);
                         }
-                    } catch { /* tous en cooldown → attente */ }
+                    } catch { }
                     await new Promise(r => setTimeout(r, 5000));
-                    return this._doRequestWithRetry(url, model, fullPrompt, onUpdate, attempt + 1, images, taskType);
+                    return this._doRequestWithRetry(slot, model, fullPrompt, onUpdate, attempt + 1, images, taskType);
                 }
-                throw new Error('Tous les providers sont en rate limit. Réessayez dans quelques minutes.');
+                throw new Error('Tous les providers/clés sont en rate limit. Réessayez dans quelques minutes.');
             }
 
             if (!response.ok) {
                 const errorText = await response.text();
-                this.router.reportError(url, false);
+                this.router.reportError(url, false, 60_000, apiKey);
                 if (attempt < 2) {
                     try {
-                        const nextUrl = await this.router.selectProvider(taskType, undefined, hasImages ?? false);
-                        if (nextUrl !== url) {
-                            vscode.window.showWarningMessage(`⚠️ Erreur ${response.status} — bascule sur ${this._detectProvider(nextUrl)}`);
-                            return this._doRequestWithRetry(nextUrl, model, fullPrompt, onUpdate, attempt + 1, images, taskType);
+                        const nextSlot = await this.router.selectProvider(taskType, undefined, hasImages ?? false);
+                        if (nextSlot.url !== url || nextSlot.apiKey !== apiKey) {
+                            vscode.window.showWarningMessage(`⚠️ Erreur ${response.status} — bascule sur ${nextSlot.name}`);
+                            return this._doRequestWithRetry(nextSlot, model, fullPrompt, onUpdate, attempt + 1, images, taskType);
                         }
                     } catch { }
                 }
@@ -492,12 +496,12 @@ export class OllamaClient {
                 }
             }
 
-            this.router.reportSuccess(url, Date.now() - t0, estimateTokens(fullResponse));
+            this.router.reportSuccess(url, Date.now() - t0, estimateTokens(fullResponse), apiKey);
             return fullResponse;
 
         } catch (error: any) {
             const msg = error.message || String(error);
-            this.router.reportError(url, false);
+            this.router.reportError(url, false, 60_000, apiKey);
             if (msg.includes('fetch') || msg.includes('ECONNREFUSED') || msg.includes('NetworkError')) {
                 vscode.window.showErrorMessage(`Serveur inaccessible sur ${url}`);
             } else {
