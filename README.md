@@ -21,7 +21,7 @@
 
 Pas besoin de compiler le code ! Suivez ces étapes simples :
 
-1.  **Télécharger le fichier** : Allez dans la section **Releases** (ou dans le dossier `bin/` du dépôt) et téléchargez le fichier `local-ai-integration-0.0.1.vsix`.
+1.  **Télécharger le fichier** : Allez dans la section **[Releases](https://github.com/Thecreatorn3ant/DevTool/releases/tag/v0.0.2)** et téléchargez le fichier `local-ai-integration-0.0.2.vsix`.
 2.  **Installer sur VS Code** :
     - Ouvrez VS Code.
     - Allez dans l'onglet **Extensions** (`Ctrl+Shift+X`).
