@@ -682,7 +682,7 @@ ${msg}
 
         if (parsed.projectSummary) {
             await this._fileCtxManager.saveProjectSummary(parsed.projectSummary);
-            vscode.window.showInformationMessage('✅ Mémoire du projet mise à jour par l\'IA.');
+            this._showNotification('✅ Mémoire du projet mise à jour', 'success');
         }
 
         if (parsed.plan) {
@@ -723,7 +723,7 @@ ${msg}
             }
         }
         if (applied > 0) {
-            vscode.window.showInformationMessage(`✅ ${applied} fichier(s) modifié(s) avec succès.`);
+            this._showNotification(`✅ ${applied} fichier(s) modifié(s)`, 'success');
         }
     }
 
@@ -738,7 +738,7 @@ ${msg}
         const related = await this._fileCtxManager.getRelatedFiles(editor.document, maxChars);
 
         if (related.length === 0) {
-            vscode.window.showInformationMessage('Aucun import local détecté dans ce fichier.');
+            this._showNotification('Aucun import local détecté', 'info');
             return;
         }
 
@@ -970,7 +970,7 @@ ${msg}
             });
             if (!newName || newName === entry.name) return;
             await this._ollamaClient.updateApiKey(entry.key, entry.url, { name: newName });
-            vscode.window.showInformationMessage(`✅ Renommé en "${newName}".`);
+            this._showNotification(`✅ Renommé en "${newName}"`, 'success');
 
         } else if (action.label.startsWith('🔑')) {
             const newKey = await vscode.window.showInputBox({
@@ -982,12 +982,12 @@ ${msg}
             if (!newKey) return;
             await this._ollamaClient.deleteApiKey(entry.key, entry.url);
             await this._ollamaClient.addApiKey({ name: entry.name, url: entry.url, key: newKey, platform: entry.platform });
-            vscode.window.showInformationMessage(`✅ Clé mise à jour pour "${entry.name}".`);
+            this._showNotification(`✅ Clé mise à jour pour "${entry.name}"`, 'success');
             await this._updateModelsList(entry.url, newKey);
 
         } else if (action.label.startsWith('🔄')) {
             await this._ollamaClient.resetKeyCooldown(entry.key, entry.url);
-            vscode.window.showInformationMessage(`✅ Cooldown réinitialisé — "${entry.name}" est disponible.`);
+            this._showNotification(`✅ Cooldown réinitialisé — "${entry.name}" disponible`, 'success');
 
         } else if (action.label.startsWith('🗑️')) {
             const confirm = await vscode.window.showWarningMessage(
@@ -997,7 +997,7 @@ ${msg}
             );
             if (confirm !== '🗑️ Supprimer') return;
             await this._ollamaClient.deleteApiKey(entry.key, entry.url);
-            vscode.window.showInformationMessage(`🗑️ Clé "${entry.name}" supprimée.`);
+            this._showNotification(`🗑️ Clé "${entry.name}" supprimée`, 'info');
             await this._updateModelsList();
         }
     }
@@ -1072,6 +1072,14 @@ ${msg}
         });
     }
 
+    private _showNotification(message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') {
+        this._view?.webview.postMessage({
+            type: 'notification',
+            message,
+            notificationType: type
+        });
+    }
+
     private _updateHistory() {
         this._context.workspaceState.update('chatHistory', this._history);
     }
@@ -1089,7 +1097,7 @@ ${msg}
         try {
             await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
             await vscode.window.showTextDocument(uri);
-            vscode.window.showInformationMessage(`✅ Fichier créé : ${fileName}`);
+            this._showNotification(`✅ Fichier créé : ${fileName}`, 'success');
         } catch (e: any) {
             vscode.window.showErrorMessage(`Erreur création : ${e.message}`);
         }
@@ -1167,19 +1175,39 @@ ${msg}
             edit.replace(doc.uri, fullRange, previewText);
             await vscode.workspace.applyEdit(edit);
             await doc.save();
-            // Ferme le diff et ouvre le vrai fichier modifié au premier plan
             await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
             const editor = await vscode.window.showTextDocument(doc, {
                 preview: false,
                 preserveFocus: false,
                 viewColumn: vscode.ViewColumn.Active
             });
-            this._highlightChangedLines(editor, oldText, previewText);
-            vscode.window.showInformationMessage(
-                `✅ ${patchCount > 0 ? `${patchCount} patch(s) appliqué(s)` : 'Fichier remplacé'} et sauvegardé !`
-            );
-            const summary = this._buildPatchSummary(path.basename(uri.fsPath), oldText, previewText, patchCount);
-            this._view?.webview.postMessage({ type: 'patchSummary', summary });
+            
+            const changedRanges = this._highlightChangedLines(editor, oldText, previewText);
+            
+            const firstChangedLine = changedRanges.length > 0 
+                ? changedRanges[0].start.line + 1 
+                : 1;
+
+            if (changedRanges.length > 0) {
+                editor.selection = new vscode.Selection(changedRanges[0].start, changedRanges[0].start);
+                editor.revealRange(changedRanges[0], vscode.TextEditorRevealType.InCenter);
+            }
+
+            const fileName = path.basename(uri.fsPath);
+            const detail = patchCount > 0 
+                ? `${patchCount} patch(s) • Ligne ${firstChangedLine}` 
+                : 'Fichier remplacé';
+
+            this._showNotification(`✅ ${fileName}: ${detail}`, 'success');
+
+            const summary = this._buildPatchSummary(fileName, oldText, previewText, patchCount);
+            this._view?.webview.postMessage({ 
+                type: 'patchSummary', 
+                summary,
+                fileName,
+                firstLine: firstChangedLine,
+                linesChanged: changedRanges.length
+            });
         }
     }
 
@@ -1196,7 +1224,7 @@ ${msg}
         return `${patchCount} bloc(s) modifié(s) dans **${fileName}** · +${added} / -${removed} lignes (${sign}${delta})`;
     }
 
-    private _highlightChangedLines(editor: vscode.TextEditor, oldText: string, newText: string) {
+    private _highlightChangedLines(editor: vscode.TextEditor, oldText: string, newText: string): vscode.Range[] {
         const oldLines = oldText.split('\n');
         const newLines = newText.split('\n');
         const changedRanges: vscode.Range[] = [];
@@ -1206,7 +1234,7 @@ ${msg}
                 changedRanges.push(editor.document.lineAt(i).range);
             }
         }
-        if (changedRanges.length === 0) return;
+        if (changedRanges.length === 0) return changedRanges;
 
         const dec = vscode.window.createTextEditorDecorationType({
             backgroundColor: 'rgba(0, 255, 120, 0.12)',
@@ -1217,6 +1245,8 @@ ${msg}
         });
         editor.setDecorations(dec, changedRanges);
         setTimeout(() => dec.dispose(), 4000);
+        
+        return changedRanges;
     }
 
     private async _handleOpenFile(fp: string) {
