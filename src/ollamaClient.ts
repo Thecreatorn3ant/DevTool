@@ -284,7 +284,8 @@ export class OllamaClient {
         targetUrl?: string,
         images?: AttachedImage[],
         taskType: TaskType = 'chat',
-        preferredApiKey: string = ''
+        preferredApiKey: string = '',
+        signal?: AbortSignal
     ): Promise<string> {
         const hasImages = images && images.length > 0;
         const config = this._getConfig();
@@ -300,7 +301,7 @@ export class OllamaClient {
             preferredApiKey
         );
 
-        return this._doRequestWithRetry(slot, model, fullPrompt, onUpdate, 0, images, taskType);
+        return this._doRequestWithRetry(slot, model, fullPrompt, onUpdate, 0, images, taskType, signal);
     }
 
     async generateResponse(
@@ -309,12 +310,13 @@ export class OllamaClient {
         modelOverride?: string,
         targetUrl?: string,
         images?: AttachedImage[],
-        preferredApiKey: string = ''
+        preferredApiKey: string = '',
+        signal?: AbortSignal
     ): Promise<string> {
         let full = '';
         await this.generateStreamingResponse(
             prompt, context, (c) => { full += c; },
-            modelOverride, targetUrl, images, 'chat', preferredApiKey
+            modelOverride, targetUrl, images, 'chat', preferredApiKey, signal
         );
         return full;
     }
@@ -326,7 +328,8 @@ export class OllamaClient {
         onUpdate: (chunk: string) => void,
         attempt: number = 0,
         images?: AttachedImage[],
-        taskType: TaskType = 'chat'
+        taskType: TaskType = 'chat',
+        signal?: AbortSignal
     ): Promise<string> {
         const { url, apiKey, name: slotName } = slot;
         const isOpenAI = this._isOpenAI(url);
@@ -392,6 +395,7 @@ export class OllamaClient {
                 method: 'POST',
                 headers,
                 body: JSON.stringify(reqBody),
+                signal
             });
 
             if (response.status === 429) {
@@ -410,11 +414,11 @@ export class OllamaClient {
                                 ? `🔄 Clé épuisée — bascule sur ${nextSlot.name} (même provider)`
                                 : `🔄 Failover → ${nextSlot.name} (${this._detectProvider(nextSlot.url)})`;
                             vscode.window.showInformationMessage(switchMsg);
-                            return this._doRequestWithRetry(nextSlot, model, fullPrompt, onUpdate, attempt + 1, images, taskType);
+                            return this._doRequestWithRetry(nextSlot, model, fullPrompt, onUpdate, attempt + 1, images, taskType, signal);
                         }
                     } catch { }
                     await new Promise(r => setTimeout(r, 5000));
-                    return this._doRequestWithRetry(slot, model, fullPrompt, onUpdate, attempt + 1, images, taskType);
+                    return this._doRequestWithRetry(slot, model, fullPrompt, onUpdate, attempt + 1, images, taskType, signal);
                 }
                 throw new Error('Tous les providers/clés sont en rate limit. Réessayez dans quelques minutes.');
             }
@@ -427,7 +431,7 @@ export class OllamaClient {
                         const nextSlot = await this.router.selectProvider(taskType, undefined, hasImages ?? false);
                         if (nextSlot.url !== url || nextSlot.apiKey !== apiKey) {
                             vscode.window.showWarningMessage(`⚠️ Erreur ${response.status} — bascule sur ${nextSlot.name}`);
-                            return this._doRequestWithRetry(nextSlot, model, fullPrompt, onUpdate, attempt + 1, images, taskType);
+                            return this._doRequestWithRetry(nextSlot, model, fullPrompt, onUpdate, attempt + 1, images, taskType, signal);
                         }
                     } catch { }
                 }

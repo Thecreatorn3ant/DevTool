@@ -1,7 +1,7 @@
 ﻿import * as vscode from 'vscode';
 import * as path from 'path';
 import * as os from 'os';
-import { OllamaClient, ContextFile, ApiKeyStatus, estimateTokens } from './ollamaClient';
+import { OllamaClient, ContextFile, ApiKeyStatus, estimateTokens, AttachedImage } from './ollamaClient';
 import { FileContextManager } from './fileContextManager';
 import { LspDiagnosticsManager } from './lspDiagnosticsManager';
 import { AgentRunner, AgentSession } from './agentRunner';
@@ -192,6 +192,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
     private _history: ChatMessage[] = [];
     private _contextFiles: ContextFile[] = [];
+    private _currentAbortController?: AbortController;
     private _thinkMode: boolean = false;
     private _currentModel: string = 'llama3';
     private _currentUrl: string = '';
@@ -246,7 +247,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {
                 case 'sendMessage':
-                    await this._handleSendMessage(data.value, data.model, data.url, data.contextFiles, data.thinkMode);
+                    await this._handleSendMessage(
+                        data.value,
+                        data.model,
+                        data.url,
+                        data.contextFiles,
+                        data.thinkMode,
+                        data.images
+                    );
                     break;
                 case 'openCloudConnect': await this._handleCloudConnection(); break;
                 case 'getModels': await this._updateModelsList(); break;
@@ -307,6 +315,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'removeContextFile':
                     this._contextFiles = this._contextFiles.filter(f => f.name !== data.name);
+                    break;
+                case 'stopGeneration':
+                    this._handleStopGeneration();
+                    break;
+                case 'revertTo':
+                    if (data.index !== undefined) this._handleRevertTo(data.index);
+                    break;
                     break;
                 case 'getTokenBudget':
                     this._sendTokenBudget();
@@ -398,7 +413,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         model?: string,
         targetUrl?: string,
         webviewContextFiles?: Array<{ name: string; content: string }>,
-        thinkMode?: boolean
+        thinkMode?: boolean,
+        images?: AttachedImage[]
     ) {
         if (!userMsg || !this._view) return;
 
@@ -475,6 +491,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         this._history.push({ role: 'user', value: userMsg });
         this._updateHistory();
+
+        if (this._currentAbortController) {
+            this._currentAbortController.abort();
+        }
+        this._currentAbortController = new AbortController();
+
         this._view.webview.postMessage({ type: 'startResponse' });
         this._view.webview.postMessage({
             type: 'tokenBudget',
@@ -493,7 +515,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     this._view?.webview.postMessage({ type: 'partialResponse', value: chunk });
                 },
                 resolvedModel,
-                resolvedUrl || undefined
+                resolvedUrl || undefined,
+                images,
+                'chat',
+                '',
+                this._currentAbortController.signal
             );
 
             this._history.push({ role: 'ai', value: fullRes });
@@ -511,11 +537,119 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             await this._processAiResponse(fullRes);
 
         } catch (e: any) {
-            const msg = e?.message ?? String(e);
-            vscode.window.showErrorMessage(`Antigravity: ${msg}`);
-            this._view.webview.postMessage({ type: 'endResponse', value: `**Erreur**: ${msg}` });
+            if (e.name === 'AbortError') {
+                // Arrêt volontaire - message dans le chat
+                this._history.push({ 
+                    role: 'ai', 
+                    value: '⚠️ Génération arrêtée par l\'utilisateur.' 
+                });
+                this._updateHistory();
+                this._view.webview.postMessage({ 
+                    type: 'endResponse', 
+                    value: '⚠️ Génération arrêtée par l\'utilisateur.' 
+                });
+            } else {
+                const msg = e?.message ?? String(e);
+                const is403 = msg.includes('403') || msg.includes('PERMISSION_DENIED');
+                const is404 = msg.includes('404') || msg.includes('not found');
+                const isRateLimit = msg.includes('429') || msg.includes('rate limit');
+                
+                let errorMessage = '';
+                
+                if (is403) {
+                    errorMessage = `❌ **Erreur 403 - Accès refusé**
+
+La requête a été refusée par le serveur. Causes possibles :
+• Clé API invalide ou expirée
+• Modèle non disponible pour votre région
+• Permissions insuffisantes pour ce modèle
+• Quota API épuisé
+
+**Solutions :**
+1. Vérifiez votre clé API dans les paramètres (☁️ Cloud)
+2. Essayez un autre modèle
+3. Consultez les limites de votre compte API
+
+_Détails : ${msg}_`;
+                } else if (is404) {
+                    errorMessage = `❌ **Erreur 404 - Modèle introuvable**
+
+Le modèle demandé n'existe pas ou n'est plus disponible.
+
+**Solutions :**
+1. Vérifiez le nom du modèle
+2. Sélectionnez un autre modèle dans la liste
+3. Mettez à jour la liste des modèles disponibles
+
+_Détails : ${msg}_`;
+                } else if (isRateLimit) {
+                    errorMessage = `⚠️ **Erreur 429 - Limite de requêtes atteinte**
+
+Vous avez atteint la limite de requêtes autorisées.
+
+**Solutions :**
+1. Attendez quelques minutes avant de réessayer
+2. Passez à un autre compte API si disponible
+3. Vérifiez les limites de votre plan API
+
+_Détails : ${msg}_`;
+                } else {
+                    errorMessage = `❌ **Erreur lors de la génération**
+
+Une erreur inattendue s'est produite :
+
+\`\`\`
+${msg}
+\`\`\`
+
+**Si l'erreur persiste :**
+• Vérifiez votre connexion réseau
+• Essayez un autre modèle
+• Consultez les logs de l'extension`;
+                }
+
+                this._history.push({ 
+                    role: 'ai', 
+                    value: errorMessage 
+                });
+                this._updateHistory();
+                
+                this._view.webview.postMessage({
+                    type: 'endResponse',
+                    value: errorMessage
+                });
+            }
             this._sendTokenBudget();
+        } finally {
+            this._currentAbortController = undefined;
         }
+    }
+
+    private _handleStopGeneration() {
+        if (this._currentAbortController) {
+            this._currentAbortController.abort();
+            this._currentAbortController = undefined;
+        }
+    }
+
+    private _handleRevertTo(index: number) {
+        if (index < 0 || index >= this._history.length) return;
+
+        const msg = this._history[index];
+        if (msg.role !== 'user') return;
+
+        this._history = this._history.slice(0, index);
+        this._updateHistory();
+
+        this._view?.webview.postMessage({
+            type: 'restoreHistory',
+            history: this._history
+        });
+
+        this._view?.webview.postMessage({
+            type: 'injectMessage',
+            value: msg.value
+        });
     }
 
     private async _processAiResponse(response: string) {
@@ -1492,10 +1626,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "}",
             "",
             "// ─── Message helpers ───",
-            "function addMsg(txt, cls, isHtml) {",
+            "function revertToMessage(index) {",
+            "    if (confirm('Revenir à ce message ?\\nL\\'historique après ce point sera supprimé.')) {",
+            "        vscode.postMessage({ type: 'revertTo', index: index });",
+            "    }",
+            "}",
+            "",
+            "function addMsg(txt, cls, isHtml, messageIndex) {",
             "    var d = document.createElement('div');",
             "    d.className = 'msg ' + cls;",
-            "    if (isHtml) { d.innerHTML = txt; } else { d.innerText = txt; }",
+            "    ",
+            "    // Container pour le contenu + bouton",
+            "    var contentWrap = document.createElement('div');",
+            "    contentWrap.style.cssText = 'display: flex; flex-direction: column; gap: 6px; width: 100%;';",
+            "    ",
+            "    var content = document.createElement('div');",
+            "    if (isHtml) { content.innerHTML = txt; } else { content.innerText = txt; }",
+            "    contentWrap.appendChild(content);",
+            "    ",
+            "    // Ajouter bouton de revert uniquement pour les messages utilisateur",
+            "    if (cls === 'user' && messageIndex !== undefined) {",
+            "        var revertBtn = document.createElement('button');",
+            "        revertBtn.className = 'msg-revert-btn';",
+            "        revertBtn.innerHTML = '↩️ Revenir à ce message';",
+            "        revertBtn.onclick = function() { revertToMessage(messageIndex); };",
+            "        contentWrap.appendChild(revertBtn);",
+            "    }",
+            "    ",
+            "    d.appendChild(contentWrap);",
             "    chat.appendChild(d);",
             "    smartScroll();",
             "    return d;",
@@ -1575,10 +1733,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "}",
             "",
             "// ─── Send message ───",
+            "var isGenerating = false;",
+            "",
+            "function showStopButton() {",
+            "    isGenerating = true;",
+            "    send.style.display = 'none';",
+            "    document.getElementById('stop').style.display = 'block';",
+            "}",
+            "",
+            "function hideStopButton() {",
+            "    isGenerating = false;",
+            "    send.style.display = 'block';",
+            "    document.getElementById('stop').style.display = 'none';",
+            "}",
+            "",
             "function sendMessage() {",
             "    var val = promptEl.value.trim();",
-            "    if (!val) return;",
+            "    if (!val || isGenerating) return;",
             "    addMsg(val, 'user', false);",
+            "    showStopButton();",
             "    var selectedOpt = modelSelect.options[modelSelect.selectedIndex];",
             "    var modelVal = modelSelect.value;",
             "    var modelUrl = selectedOpt ? (selectedOpt.getAttribute('data-url') || '') : '';",
@@ -1595,6 +1768,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "}",
             "",
             "send.onclick = sendMessage;",
+            "document.getElementById('stop').onclick = function() {",
+            "    vscode.postMessage({ type: 'stopGeneration' });",
+            "    hideStopButton();",
+            "};",
             "promptEl.addEventListener('keydown', function(e) {",
             "    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }",
             "});",
@@ -1695,6 +1872,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "        }",
             "    }",
             "    if (m.type === 'startResponse') {",
+            "        showStopButton();",
             "        currentAiMsg = document.createElement('div');",
             "        currentAiMsg.className = 'msg ai';",
             "        currentAiMsg.innerHTML = '<div class=\"thinking\"><span></span><span></span><span></span></div>';",
@@ -1709,6 +1887,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "        smartScroll();",
             "    }",
             "    if (m.type === 'endResponse') {",
+            "        hideStopButton();",
             "        var finalText = m.value || currentAiText;",
             "        if (currentAiMsg) { currentAiMsg.innerHTML = renderMarkdown(finalText); }",
             "        else { addMsg(renderMarkdown(finalText), 'ai', true); }",
@@ -1717,8 +1896,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "    if (m.type === 'fileContent') { addContextFile(m.name, m.content); }",
             "    if (m.type === 'injectMessage') { promptEl.value = m.value; promptEl.focus(); }",
             "    if (m.type === 'restoreHistory' && m.history) {",
-            "        m.history.forEach(function(msg) {",
-            "            addMsg(msg.role === 'ai' ? renderMarkdown(msg.value) : msg.value, msg.role, msg.role === 'ai');",
+            "        chat.innerHTML = '';",
+            "        m.history.forEach(function(msg, index) {",
+            "            if (msg.role === 'user') {",
+            "                addMsg(msg.value, 'user', false, index);",
+            "            } else {",
+            "                addMsg(renderMarkdown(msg.value), 'ai', true);",
+            "            }",
             "        });",
             "    }",
             "    if (m.type === 'statusMessage') { addStatusMsg(m.value); }",
@@ -1928,6 +2112,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         #prompt:focus { border-color: rgba(0,210,255,0.5); }
         #send { background: #007acc; color: #fff; border: none; padding: 10px 18px; border-radius: 22px; cursor: pointer; font-weight: 700; font-size: 13px; white-space: nowrap; transition: background 0.2s; }
         #send:hover { background: #0090e0; }
+        #stop { background: #ff6b6b; color: #fff; border: none; padding: 10px 18px; border-radius: 22px; cursor: pointer; font-weight: 700; font-size: 13px; white-space: nowrap; transition: background 0.2s; font-family: 'Inter', sans-serif; }
+        #stop:hover { background: #ff5252; }
+        /* ── Message revert button ── */
+        .msg-revert-btn { align-self: flex-start; background: rgba(100, 100, 255, 0.08); border: 1px solid rgba(100, 100, 255, 0.25); color: #7a8fff; padding: 4px 10px; border-radius: 10px; font-size: 11px; cursor: pointer; transition: all 0.2s; margin-top: 4px; font-family: 'Inter', sans-serif; font-weight: 500; }
+        .msg-revert-btn:hover { background: rgba(100, 100, 255, 0.15); border-color: rgba(100, 100, 255, 0.4); color: #9bb0ff; }
         .input-actions { display: flex; gap: 6px; flex-wrap: wrap; }
         .btn-action { background: rgba(255,255,255,0.06); color: #aaa; border: 1px solid #333; padding: 4px 10px; border-radius: 12px; cursor: pointer; font-size: 11px; transition: all 0.2s; white-space: nowrap; }
         .btn-action:hover { background: rgba(255,255,255,0.12); color: #fff; }
@@ -2040,6 +2229,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <div class="input-row">
             <textarea id="prompt" placeholder="Posez une question… (Entrée pour envoyer, Shift+Entrée pour saut de ligne)" rows="1"></textarea>
             <button id="send">SEND</button>
+            <button id="stop" style="display:none;">⏹ STOP</button>
         </div>
     </div>
     <script>${script}</script>
