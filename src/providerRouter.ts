@@ -61,6 +61,7 @@ export interface ProviderCapabilities {
 export interface ProviderHealth {
     url: string;
     apiKey: string;
+    keyHint: string;
     name: string;
     provider: string;
     available: boolean;
@@ -162,7 +163,8 @@ export class ProviderRouter {
         if (!this._health.has(slot)) {
             this._health.set(slot, {
                 url,
-                apiKey: this._keyHint(apiKey),
+                apiKey,
+                keyHint: this._keyHint(apiKey),
                 name,
                 provider,
                 available: true,
@@ -218,7 +220,7 @@ export class ProviderRouter {
 
         if (preferredUrl) {
             const prefSlot = this._slotKey(preferredUrl, preferredApiKey);
-            const exact = available.find(h => this._slotKey(h.url, this._fullKeys.get(this._slotKey(h.url, h.apiKey)) ?? '') === prefSlot);
+            const exact = available.find(h => this._slotKey(h.url, h.apiKey) === prefSlot);
             if (exact) return this._slotToSelected(exact);
 
             const preferredProvider = allSlots.find(h =>
@@ -244,10 +246,9 @@ export class ProviderRouter {
     }
 
     private _slotToSelected(h: ProviderHealth): SelectedSlot {
-        const slot = this._slotKey(h.url, h.apiKey);
         return {
             url: h.url,
-            apiKey: this._fullKeys.get(slot) ?? '',
+            apiKey: h.apiKey,
             name: h.name,
             provider: h.provider,
         };
@@ -273,7 +274,7 @@ export class ProviderRouter {
         h.totalTokens += tokensUsed;
         h.available = true;
         h.lastChecked = Date.now();
-        h.errorRate = Math.max(0, h.errorRate - 0.05);
+        h.errorRate = Math.max(0, h.errorRate - 0.1); // Recuperation plus rapide (0.1 au lieu de 0.05)
         this._syncStats();
         this._drainQueue();
     }
@@ -632,7 +633,10 @@ export class ProviderRouter {
     }
 
     private _syncStats() {
-        this._stats.providers = Array.from(this._health.values());
+        this._stats.providers = Array.from(this._health.values()).map(h => ({
+            ...h,
+            apiKey: h.keyHint
+        }));
         this._stats.queueLength = this._queue.length;
         this._stats.lastUpdated = Date.now();
         this._stats.forcedLocalActive = this._forcedLocalActive;
