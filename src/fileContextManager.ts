@@ -94,36 +94,43 @@ export class FileContextManager {
         return null;
     }
 
-    async handleAiFileRequest(filePath: string): Promise<{ name: string; content: string } | null> {
+    isInWorkspace(filePath: string): boolean {
+        const folders = vscode.workspace.workspaceFolders;
+        if (!folders) return false;
+        if (!path.isAbsolute(filePath)) return true;
+        return folders.some(f => filePath.startsWith(f.uri.fsPath));
+    }
+
+    async handleAiFileRequest(
+        filePath: string,
+        filePermission: 'ask-all' | 'ask-workspace' | 'allow-all' = 'ask-workspace'
+    ): Promise<{ name: string; content: string } | null> {
+        const inWorkspace = this.isInWorkspace(filePath);
         const isSensitive = filePath.includes('.env') || filePath.includes('secret') ||
             filePath.includes('password') || filePath.includes('credential');
 
-        const warningMsg = isSensitive
-            ? `⚠️ L'IA demande accès à un fichier sensible : "${filePath}". Autoriser ?`
-            : `L'IA demande accès à : "${filePath}". Autoriser ?`;
+        const needsConfirm = isSensitive
+            || filePermission === 'ask-all'
+            || (filePermission === 'ask-workspace' && !inWorkspace);
 
-        const result = await vscode.window.showInformationMessage(
-            warningMsg,
-            { modal: true },
-            '✅ Autoriser',
-            '❌ Refuser'
-        );
-
-        if (result !== '✅ Autoriser') return null;
+        if (needsConfirm) {
+            const msg = isSensitive
+                ? `⚠️ Fichier sensible : "${filePath}". Autoriser l'accès ?`
+                : `Fichier hors workspace : "${filePath}". Autoriser l'accès ?`;
+            const r = await vscode.window.showInformationMessage(msg, { modal: true }, '✅ Autoriser', '❌ Refuser');
+            if (r !== '✅ Autoriser') return null;
+        }
 
         const file = await this.readFile(filePath);
         if (!file) {
             const uris = await vscode.window.showOpenDialog({
                 canSelectFiles: true,
                 openLabel: `Sélectionner "${filePath}"`,
-                title: `Fichier introuvable — sélection manuelle`
+                title: 'Fichier introuvable — sélection manuelle'
             });
             if (uris?.[0]) {
                 const bytes = await vscode.workspace.fs.readFile(uris[0]);
-                return {
-                    name: vscode.workspace.asRelativePath(uris[0]),
-                    content: bytes.toString()
-                };
+                return { name: vscode.workspace.asRelativePath(uris[0]), content: bytes.toString() };
             }
         }
         return file;

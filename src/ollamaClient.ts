@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { ProviderRouter, TaskType, FREE_MODELS } from './providerRouter';
 
 export interface ApiKeyEntry {
     key: string;
@@ -30,6 +31,14 @@ export interface TokenBudget {
     isCloud: boolean;
 }
 
+export interface AttachedImage {
+    base64: string;
+    mimeType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
+    width?: number;
+    height?: number;
+    label?: string;
+}
+
 export function estimateTokens(text: string): number {
     return Math.ceil(text.length / 4);
 }
@@ -47,6 +56,9 @@ const LOCAL_LIMITS: Record<string, number> = {
     'phi4': 8000,
     'gemma': 4000,
     'gemma2': 8000,
+    'llava': 8000,
+    'bakllava': 8000,
+    'moondream': 4000,
 };
 
 function getLocalMaxChars(model: string): number {
@@ -71,7 +83,30 @@ function migrateKeyEntry(raw: any): ApiKeyEntry | null {
     };
 }
 
+const VISION_MODELS: Record<string, string[]> = {
+    'gemini': ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash'],
+    'openai': ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo'],
+    'openrouter': ['google/gemini-flash-1.5', 'openai/gpt-4o-mini', 'anthropic/claude-3-haiku'],
+    'anthropic': ['claude-3-5-sonnet-20241022', 'claude-3-haiku-20240307'],
+    'local': ['llava', 'bakllava', 'llava-phi3', 'moondream', 'llava-llama3'],
+};
+
+function isVisionModel(model: string, provider: string): boolean {
+    const m = model.toLowerCase();
+    const visionList = VISION_MODELS[provider] || [];
+    if (visionList.some(v => m.includes(v.toLowerCase()))) return true;
+    return m.includes('vision') || m.includes('llava') || m.includes('4o') ||
+        m.includes('gemini') || m.includes('claude-3') || m.includes('moondream');
+}
+
 export class OllamaClient {
+    readonly router: ProviderRouter;
+
+    constructor() {
+        this.router = new ProviderRouter();
+        this.router.registerProvider('http://localhost:11434', 'Ollama Local', 'local');
+        this._syncProvidersToRouter();
+    }
 
     private _getConfig() {
         return vscode.workspace.getConfiguration('local-ai');
@@ -79,6 +114,17 @@ export class OllamaClient {
 
     private _getBaseUrl(): string {
         return this._getConfig().get<string>('ollamaUrl') || 'http://localhost:11434';
+    }
+
+    _syncProvidersToRouter() {
+        for (const entry of this.getApiKeys()) {
+            if (!entry.url) continue;
+            const provider = this._detectProvider(entry.url);
+            this.router.registerProvider(entry.url, entry.name, provider, entry.key);
+            if (entry.rateLimitedUntil && entry.rateLimitedUntil > Date.now()) {
+                this.router.reportRateLimit(entry.url, entry.rateLimitedUntil - Date.now(), entry.key);
+            }
+        }
     }
 
     getApiKeys(): ApiKeyEntry[] {
@@ -100,24 +146,25 @@ export class OllamaClient {
         }
         keys.push({ ...entry, addedAt: Date.now() });
         await this._saveApiKeys(keys);
+        const provider = this._detectProvider(entry.url);
+        this.router.registerProvider(entry.url, entry.name, provider, entry.key);
         return { success: true };
     }
 
-    async updateApiKey(
-        keyValue: string,
-        url: string,
-        updates: Partial<Omit<ApiKeyEntry, 'key' | 'addedAt'>>
-    ): Promise<void> {
+    async updateApiKey(keyValue: string, url: string, updates: Partial<Omit<ApiKeyEntry, 'key' | 'addedAt'>>): Promise<void> {
         const keys = this.getApiKeys();
         const idx = keys.findIndex(k => k.key === keyValue && k.url === url);
         if (idx === -1) return;
         keys[idx] = { ...keys[idx], ...updates };
         await this._saveApiKeys(keys);
+        this._syncProvidersToRouter();
     }
 
     async deleteApiKey(keyValue: string, url: string): Promise<void> {
         const keys = this.getApiKeys().filter(k => !(k.key === keyValue && k.url === url));
         await this._saveApiKeys(keys);
+        this.router.unregisterProvider(url);
+        this._syncProvidersToRouter();
     }
 
     async resetKeyCooldown(keyValue: string, url: string): Promise<void> {
@@ -126,6 +173,8 @@ export class OllamaClient {
         if (idx === -1) return;
         delete keys[idx].rateLimitedUntil;
         await this._saveApiKeys(keys);
+        this.router.setAvailable(url, true, keyValue);
+        this.router.liftSuspension(url, keyValue);
     }
 
     getApiKeyStatuses(): ApiKeyStatus[] {
@@ -136,13 +185,7 @@ export class OllamaClient {
             }
             if (entry.rateLimitedUntil && entry.rateLimitedUntil > now) {
                 const secsLeft = Math.ceil((entry.rateLimitedUntil - now) / 1000);
-                return {
-                    entry,
-                    status: 'cooldown' as ApiKeyStatusCode,
-                    cooldownSecsLeft: secsLeft,
-                    statusIcon: '🟡',
-                    statusLabel: `Cooldown ${secsLeft}s`,
-                };
+                return { entry, status: 'cooldown' as ApiKeyStatusCode, cooldownSecsLeft: secsLeft, statusIcon: '🟡', statusLabel: `Cooldown ${secsLeft}s` };
             }
             return { entry, status: 'available' as ApiKeyStatusCode, statusIcon: '🟢', statusLabel: 'Disponible' };
         });
@@ -151,35 +194,34 @@ export class OllamaClient {
     private _getAvailableKey(targetUrl: string): { key: string; entry?: ApiKeyEntry } {
         const keys = this.getApiKeys();
         const now = Date.now();
-
         const exact = keys.find(k =>
             k.url && targetUrl.startsWith(k.url.replace(/\/+$/, '')) &&
             (!k.rateLimitedUntil || k.rateLimitedUntil < now)
         );
         if (exact) return { key: exact.key, entry: exact };
-
         const platformMatch = keys.find(k =>
             k.platform && targetUrl.includes(k.platform) &&
             (!k.rateLimitedUntil || k.rateLimitedUntil < now)
         );
         if (platformMatch) return { key: platformMatch.key, entry: platformMatch };
-
         const legacyKey = this._getConfig().get<string>('apiKey') || '';
         return { key: legacyKey };
     }
 
-    private async _markKeyAsRateLimited(keyValue: string, url: string, keyName?: string): Promise<void> {
+    private async _markKeyAsRateLimited(keyValue: string, url: string, cooldownMs = 60_000): Promise<void> {
         const keys = this.getApiKeys();
-        const now = Date.now();
         let changed = false;
         const updated = keys.map(k => {
             if (k.key === keyValue && k.url === url) {
                 changed = true;
-                return { ...k, rateLimitedUntil: now + 60_000 };
+                return { ...k, rateLimitedUntil: Date.now() + cooldownMs };
             }
             return k;
         });
-        if (changed) await this._saveApiKeys(updated);
+        if (changed) {
+            await this._saveApiKeys(updated);
+            this.router.reportRateLimit(url, cooldownMs);
+        }
     }
 
     isCloud(url?: string): boolean {
@@ -205,29 +247,33 @@ export class OllamaClient {
         const budget = this.getTokenBudget(model, targetUrl);
         const historyChars = history.length;
         let remaining = budget.max - historyChars - 500;
-
         const parts: string[] = [];
-
         const activeFiles = files.filter(f => f.isActive);
         const otherFiles = files.filter(f => !f.isActive);
-
         for (const f of [...activeFiles, ...otherFiles]) {
             if (remaining <= 0) break;
             const header = `[FICHIER${f.isActive ? ' ACTIF' : ''}: ${f.name}]\n`;
             const available = remaining - header.length;
             if (available <= 100) break;
-
             const truncated = f.content.length > available
                 ? f.content.substring(0, available) + '\n[... tronqué ...]'
                 : f.content;
-
             parts.push(header + truncated);
             remaining -= (header.length + truncated.length);
         }
-
         budget.used = budget.max - remaining;
-        const context = parts.join('\n\n');
-        return { context, budget };
+        return { context: parts.join('\n\n'), budget };
+    }
+
+    modelSupportsVision(model: string, url: string): boolean {
+        const provider = this._detectProvider(url);
+        return isVisionModel(model, provider);
+    }
+
+    getBestVisionModel(url: string): string | null {
+        const provider = this._detectProvider(url);
+        const list = VISION_MODELS[provider];
+        return list?.[0] ?? null;
     }
 
     async generateStreamingResponse(
@@ -235,35 +281,63 @@ export class OllamaClient {
         context: string,
         onUpdate: (chunk: string) => void,
         modelOverride?: string,
-        targetUrl?: string
+        targetUrl?: string,
+        images?: AttachedImage[],
+        taskType: TaskType = 'chat',
+        preferredApiKey: string = ''
     ): Promise<string> {
-        const url = targetUrl || this._getBaseUrl();
+        const hasImages = images && images.length > 0;
         const config = this._getConfig();
         const model = modelOverride || config.get<string>('defaultModel') || 'llama3';
-
         const fullPrompt = context
             ? `Contexte du projet:\n${context}\n\n---\nQuestion: ${prompt}`
             : prompt;
 
-        return await this._doRequestWithRetry(url, model, fullPrompt, onUpdate);
+        let slot = await this.router.selectProvider(
+            taskType,
+            targetUrl,
+            hasImages ?? false,
+            preferredApiKey
+        );
+
+        return this._doRequestWithRetry(slot, model, fullPrompt, onUpdate, 0, images, taskType);
+    }
+
+    async generateResponse(
+        prompt: string,
+        context: string = '',
+        modelOverride?: string,
+        targetUrl?: string,
+        images?: AttachedImage[],
+        preferredApiKey: string = ''
+    ): Promise<string> {
+        let full = '';
+        await this.generateStreamingResponse(
+            prompt, context, (c) => { full += c; },
+            modelOverride, targetUrl, images, 'chat', preferredApiKey
+        );
+        return full;
     }
 
     private async _doRequestWithRetry(
-        url: string,
+        slot: import('./providerRouter').SelectedSlot,
         model: string,
         fullPrompt: string,
         onUpdate: (chunk: string) => void,
-        attempt: number = 0
+        attempt: number = 0,
+        images?: AttachedImage[],
+        taskType: TaskType = 'chat'
     ): Promise<string> {
-        const { key: apiKey, entry: keyEntry } = this._getAvailableKey(url);
+        const { url, apiKey, name: slotName } = slot;
         const isOpenAI = this._isOpenAI(url);
         const isGemini = this._isGemini(url);
         const systemPrompt = this._getSystemPrompt();
+        const hasImages = images && images.length > 0;
+        const t0 = Date.now();
 
         try {
             const headers: Record<string, string> = { 'Content-Type': 'application/json' };
             if (apiKey && !isGemini) headers['Authorization'] = `Bearer ${apiKey}`;
-
             if (url.includes('openrouter')) {
                 headers['HTTP-Referer'] = 'https://github.com/microsoft/vscode';
                 headers['X-Title'] = 'VSCode Antigravity';
@@ -274,27 +348,43 @@ export class OllamaClient {
 
             if (isGemini) {
                 endpoint = `${url}/models/${model}:streamGenerateContent?key=${apiKey}`;
-                reqBody = {
-                    contents: [{
-                        role: 'user',
-                        parts: [{ text: systemPrompt + "\n\n" + fullPrompt }]
-                    }]
-                };
+                const parts: any[] = [{ text: systemPrompt + '\n\n' + fullPrompt }];
+                if (hasImages) {
+                    for (const img of images!) {
+                        parts.unshift({ inlineData: { mimeType: img.mimeType, data: img.base64 } });
+                    }
+                }
+                reqBody = { contents: [{ role: 'user', parts }] };
+
             } else if (isOpenAI) {
+                let userContent: any;
+                if (hasImages) {
+                    userContent = [
+                        ...images!.map(img => ({
+                            type: 'image_url',
+                            image_url: { url: `data:${img.mimeType};base64,${img.base64}` }
+                        })),
+                        { type: 'text', text: fullPrompt }
+                    ];
+                } else {
+                    userContent = fullPrompt;
+                }
                 reqBody = {
                     model,
                     messages: [
                         { role: 'system', content: systemPrompt },
-                        { role: 'user', content: fullPrompt }
+                        { role: 'user', content: userContent }
                     ],
                     stream: true
                 };
+
             } else {
                 reqBody = {
                     model,
                     prompt: fullPrompt,
                     system: systemPrompt,
-                    stream: true
+                    stream: true,
+                    ...(hasImages && { images: images!.map(i => i.base64) })
                 };
             }
 
@@ -304,27 +394,48 @@ export class OllamaClient {
                 body: JSON.stringify(reqBody),
             });
 
-            if (response.status === 429 && attempt < 3) {
-                if (apiKey && keyEntry) {
-                    await this._markKeyAsRateLimited(apiKey, keyEntry.url, keyEntry.name);
-                    vscode.window.showWarningMessage(
-                        `⏳ Rate Limit — "${keyEntry.name}" est en cooldown 60s. Bascule automatique sur la prochaine clé disponible...`
-                    );
-                    return this._doRequestWithRetry(url, model, fullPrompt, onUpdate, attempt + 1);
-                } else {
-                    vscode.window.showWarningMessage('⏳ Rate Limit atteint. Attente 5s avant de réessayer...');
+            if (response.status === 429) {
+                const retryAfterSec = parseInt(response.headers.get('retry-after') || '60', 10);
+                const cooldownMs = (isNaN(retryAfterSec) ? 60 : retryAfterSec) * 1000;
+
+                await this._markKeyAsRateLimited(apiKey, url, cooldownMs);
+                this.router.reportRateLimit(url, cooldownMs, apiKey);
+
+                if (attempt < 4) {
+                    try {
+                        const nextSlot = await this.router.selectProvider(taskType, url, hasImages ?? false, apiKey);
+                        const isSameSlot = nextSlot.url === url && nextSlot.apiKey === apiKey;
+                        if (!isSameSlot) {
+                            const switchMsg = nextSlot.url === url
+                                ? `🔄 Clé épuisée — bascule sur ${nextSlot.name} (même provider)`
+                                : `🔄 Failover → ${nextSlot.name} (${this._detectProvider(nextSlot.url)})`;
+                            vscode.window.showInformationMessage(switchMsg);
+                            return this._doRequestWithRetry(nextSlot, model, fullPrompt, onUpdate, attempt + 1, images, taskType);
+                        }
+                    } catch { }
                     await new Promise(r => setTimeout(r, 5000));
-                    return this._doRequestWithRetry(url, model, fullPrompt, onUpdate, attempt + 1);
+                    return this._doRequestWithRetry(slot, model, fullPrompt, onUpdate, attempt + 1, images, taskType);
                 }
+                throw new Error('Tous les providers/clés sont en rate limit. Réessayez dans quelques minutes.');
             }
 
             if (!response.ok) {
                 const errorText = await response.text();
+                this.router.reportError(url, false, 60_000, apiKey);
+                if (attempt < 2) {
+                    try {
+                        const nextSlot = await this.router.selectProvider(taskType, undefined, hasImages ?? false);
+                        if (nextSlot.url !== url || nextSlot.apiKey !== apiKey) {
+                            vscode.window.showWarningMessage(`⚠️ Erreur ${response.status} — bascule sur ${nextSlot.name}`);
+                            return this._doRequestWithRetry(nextSlot, model, fullPrompt, onUpdate, attempt + 1, images, taskType);
+                        }
+                    } catch { }
+                }
                 throw new Error(`HTTP ${response.status}: ${errorText || response.statusText}`);
             }
 
             const reader = response.body?.getReader();
-            if (!reader) throw new Error("Impossible de lire le flux de réponse.");
+            if (!reader) throw new Error('Impossible de lire le flux de réponse.');
 
             const decoder = new TextDecoder();
             let fullResponse = '';
@@ -333,7 +444,6 @@ export class OllamaClient {
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
-
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split('\n');
                 buffer = lines.pop() ?? '';
@@ -372,15 +482,13 @@ export class OllamaClient {
             }
 
             if (buffer.trim()) {
-                if (isOpenAI) {
-                    if (buffer.startsWith('data: ') && buffer !== 'data: [DONE]') {
-                        try {
-                            const data = JSON.parse(buffer.slice(6));
-                            const content = data.choices?.[0]?.delta?.content;
-                            if (content) { fullResponse += content; onUpdate(content); }
-                        } catch { }
-                    }
-                } else {
+                if (isOpenAI && buffer.startsWith('data: ') && buffer !== 'data: [DONE]') {
+                    try {
+                        const data = JSON.parse(buffer.slice(6));
+                        const content = data.choices?.[0]?.delta?.content;
+                        if (content) { fullResponse += content; onUpdate(content); }
+                    } catch { }
+                } else if (!isOpenAI) {
                     try {
                         const data = JSON.parse(buffer);
                         if (data.response) { fullResponse += data.response; onUpdate(data.response); }
@@ -388,10 +496,12 @@ export class OllamaClient {
                 }
             }
 
+            this.router.reportSuccess(url, Date.now() - t0, estimateTokens(fullResponse), apiKey);
             return fullResponse;
 
         } catch (error: any) {
             const msg = error.message || String(error);
+            this.router.reportError(url, false, 60_000, apiKey);
             if (msg.includes('fetch') || msg.includes('ECONNREFUSED') || msg.includes('NetworkError')) {
                 vscode.window.showErrorMessage(`Serveur inaccessible sur ${url}`);
             } else {
@@ -399,6 +509,41 @@ export class OllamaClient {
             }
             return '';
         }
+    }
+
+    async detectBestFreeModel(preferVision: boolean = false): Promise<{ url: string; model: string; provider: string } | null> {
+        const all = await this.listAllModels();
+
+        if (!preferVision) {
+            const local = all.find(m => m.isLocal);
+            if (local) return { url: local.url, model: local.name, provider: 'local' };
+        }
+
+        if (preferVision) {
+            const localVision = all.find(m => m.isLocal && isVisionModel(m.name, 'local'));
+            if (localVision) return { url: localVision.url, model: localVision.name, provider: 'local' };
+        }
+
+        for (const entry of this.getApiKeys()) {
+            if (!this._isGemini(entry.url)) continue;
+            const geminiModels = FREE_MODELS['gemini'];
+            const target = preferVision ? geminiModels[0] : geminiModels[0];
+            if (target) return { url: entry.url, model: target, provider: 'gemini' };
+        }
+
+        for (const entry of this.getApiKeys()) {
+            if (!entry.url.includes('openrouter')) continue;
+            const freeModel = all.find(m => m.url === entry.url);
+            if (freeModel) return { url: entry.url, model: freeModel.name, provider: 'openrouter' };
+        }
+
+        for (const entry of this.getApiKeys()) {
+            if (!entry.url.includes('groq')) continue;
+            const groqModel = FREE_MODELS['groq']?.[0];
+            if (groqModel) return { url: entry.url, model: groqModel, provider: 'groq' };
+        }
+
+        return null;
     }
 
     private _getSystemPrompt(): string {
@@ -412,6 +557,7 @@ export class OllamaClient {
 - Pour suggérer une commande terminal, utilise : [CMD: commande] (ex: [CMD: npm install]). Pour une commande destructive ou risquée : [CMD_IMPORTANT: commande] (ex: [CMD_IMPORTANT: rm -rf dist]). L'utilisateur sera toujours consulté avant exécution selon ses préférences.
 - Si tu identifies plusieurs fichiers à modifier, liste-les TOUS avant de commencer avec : [WILL_MODIFY: fichier1, fichier2, ...]
 - Pour le mode "Réflexion", commence par un bloc [PLAN] qui liste toutes les modifications envisagées avant tout code.
+- Si une image t'est fournie, analyse-la attentivement : identifie les erreurs, le code visible, les captures d'écran et base ton analyse sur ce que tu vois.
 
 ━━━ FORMAT OBLIGATOIRE POUR MODIFIER UN FICHIER ━━━
 Toujours utiliser les blocs SEARCH/REPLACE avec le fichier cible.
@@ -429,12 +575,6 @@ Règles :
 1. SEARCH doit être un copié-collé STRICT.
 2. Inclure 2 lignes de contexte avant et après.
 3. Si tu crées un nouveau fichier : [CREATE_FILE: chemin] suivi du contenu complet.`;
-    }
-
-    async generateResponse(prompt: string, context: string = '', modelOverride?: string, targetUrl?: string): Promise<string> {
-        let full = '';
-        await this.generateStreamingResponse(prompt, context, (c) => { full += c; }, modelOverride, targetUrl);
-        return full;
     }
 
     private _isOpenAI(url: string): boolean {
@@ -475,7 +615,6 @@ Règles :
         const { key: apiKey } = this._getAvailableKey(url);
         const headers: Record<string, string> = {};
         if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-
         try {
             const isOpenAI = this._isOpenAI(url);
             const endpoint = isOpenAI ? `${url}/models` : `${url}/api/tags`;
@@ -549,7 +688,8 @@ Règles :
                             : (data?.models || []).map((m: any) => (m.name ?? m.id) as string).filter(Boolean);
                     }
                 }
-                for (const m of list) {
+                const filteredList = provider === 'openrouter' ? list.filter((m: string) => m.endsWith(':free')) : list;
+                for (const m of filteredList) {
                     const k = `${baseUrl}||${m}`;
                     const isLocal = !entry.key && (baseUrl === LOCAL_URL || baseUrl === 'http://127.0.0.1:11434');
                     if (!seen.has(k)) { seen.add(k); result.push({ name: m, isLocal, url: baseUrl, provider: isLocal ? 'local' : provider }); }
@@ -571,5 +711,9 @@ Règles :
             const response = await fetch(endpoint, { headers, signal: AbortSignal.timeout(3000) });
             return response.ok;
         } catch { return false; }
+    }
+
+    dispose() {
+        this.router.dispose();
     }
 }
