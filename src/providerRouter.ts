@@ -2,6 +2,9 @@ import * as vscode from 'vscode';
 
 export type TaskType = 'chat' | 'code' | 'vision' | 'commit' | 'agent';
 
+const SUSPENSION_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+const FAILOVER_PRIORITY: string[] = ['local', 'openrouter', 'groq', 'mistral', 'together', 'openai', 'anthropic', 'ollama-cloud'];
+
 export interface ProviderCapabilities {
     vision: boolean;
     streaming: boolean;
@@ -14,6 +17,7 @@ export interface ProviderHealth {
     name: string;
     provider: string;
     available: boolean;
+    suspended: boolean;
     latencyMs: number;
     errorRate: number;
     rateLimitedUntil: number;
@@ -28,8 +32,10 @@ export interface RouterStats {
     providers: ProviderHealth[];
     totalRequests: number;
     totalFailovers: number;
+    totalSuspensions: number;
     queueLength: number;
     lastUpdated: number;
+    forcedLocalActive: boolean;
 }
 
 export interface QueuedRequest {
@@ -39,6 +45,16 @@ export interface QueuedRequest {
     reject: (err: Error) => void;
     createdAt: number;
     timeoutMs: number;
+}
+
+export interface ProviderSuspendedEvent {
+    url: string;
+    name: string;
+    provider: string;
+    rateLimitedUntil: number;
+    cooldownHours: number;
+    failoverUrl: string | null;
+    failoverName: string | null;
 }
 
 const PROVIDER_CAPS: Record<string, ProviderCapabilities> = {
@@ -64,14 +80,19 @@ export class ProviderRouter {
     private _health = new Map<string, ProviderHealth>();
     private _queue: QueuedRequest[] = [];
     private _queueTimer?: NodeJS.Timeout;
+    private _forcedLocalActive = false;
     private _stats: RouterStats = {
         providers: [],
         totalRequests: 0,
         totalFailovers: 0,
+        totalSuspensions: 0,
         queueLength: 0,
         lastUpdated: Date.now(),
+        forcedLocalActive: false,
     };
+
     private _onStatsChanged?: (stats: RouterStats) => void;
+    private _onProviderSuspended?: (event: ProviderSuspendedEvent) => void;
 
     registerProvider(url: string, name: string, provider: string, apiKey?: string) {
         const key = this._urlKey(url);
@@ -81,6 +102,7 @@ export class ProviderRouter {
                 name,
                 provider,
                 available: true,
+                suspended: false,
                 latencyMs: 0,
                 errorRate: 0,
                 rateLimitedUntil: 0,
@@ -106,9 +128,15 @@ export class ProviderRouter {
     ): Promise<string> {
         this._stats.totalRequests++;
 
+        if (this._forcedLocalActive) {
+            const local = this._findLocalProvider();
+            if (local) return local.url;
+        }
+
         const now = Date.now();
         const candidates = Array.from(this._health.values())
             .filter(h => {
+                if (h.suspended) return false;
                 if (h.rateLimitedUntil > now) return false;
                 if (!h.available) return false;
                 if (requireVision && !h.capabilities.vision) return false;
@@ -122,12 +150,12 @@ export class ProviderRouter {
         if (preferredUrl) {
             const preferred = candidates.find(c => this._urlKey(c.url) === this._urlKey(preferredUrl));
             if (preferred) return preferred.url;
+            this._stats.totalFailovers++;
         }
 
-        const scored = candidates.map(h => ({
-            h,
-            score: this._score(h, task),
-        })).sort((a, b) => b.score - a.score);
+        const scored = candidates
+            .map(h => ({ h, score: this._score(h, task) }))
+            .sort((a, b) => b.score - a.score);
 
         return scored[0].h.url;
     }
@@ -163,12 +191,15 @@ export class ProviderRouter {
         h.totalErrors++;
         h.errorRate = Math.min(1, h.errorRate + 0.2);
         h.lastChecked = Date.now();
+
         if (isRateLimit) {
             h.rateLimitedUntil = Date.now() + cooldownMs;
             h.available = true;
+            this._checkSuspension(h, cooldownMs);
         } else if (h.errorRate > 0.6) {
             h.available = false;
         }
+
         this._stats.totalFailovers++;
         this._syncStats();
     }
@@ -179,8 +210,128 @@ export class ProviderRouter {
 
     setAvailable(url: string, available: boolean) {
         const h = this._health.get(this._urlKey(url));
-        if (h) { h.available = available; this._syncStats(); }
+        if (h) {
+            h.available = available;
+            if (available) h.suspended = false;
+            this._syncStats();
+        }
     }
+
+    private _checkSuspension(h: ProviderHealth, cooldownMs: number) {
+        if (cooldownMs < SUSPENSION_THRESHOLD_MS) return;
+        if (h.suspended) return;
+
+        h.suspended = true;
+        this._stats.totalSuspensions++;
+
+        const cooldownHours = Math.ceil(cooldownMs / (60 * 60 * 1000));
+        const failover = this._findBestFailover(h.provider);
+
+        const event: ProviderSuspendedEvent = {
+            url: h.url,
+            name: h.name,
+            provider: h.provider,
+            rateLimitedUntil: h.rateLimitedUntil,
+            cooldownHours,
+            failoverUrl: failover?.url ?? null,
+            failoverName: failover?.name ?? null,
+        };
+
+        this._onProviderSuspended?.(event);
+        this._syncStats();
+    }
+
+    liftSuspension(url: string) {
+        const h = this._health.get(this._urlKey(url));
+        if (!h) return;
+        h.suspended = false;
+        h.rateLimitedUntil = 0;
+        h.available = true;
+        h.errorRate = Math.max(0, h.errorRate - 0.3);
+        this._syncStats();
+        this._drainQueue();
+    }
+
+    isSuspended(url: string): boolean {
+        const h = this._health.get(this._urlKey(url));
+        return h?.suspended ?? false;
+    }
+
+    getVisibleProviders(): ProviderHealth[] {
+        return Array.from(this._health.values()).filter(h => !h.suspended);
+    }
+
+    getSuspendedProviders(): ProviderHealth[] {
+        const now = Date.now();
+        return Array.from(this._health.values())
+            .filter(h => h.suspended)
+            .map(h => ({
+                ...h,
+                _remainingMs: Math.max(0, h.rateLimitedUntil - now),
+            })) as ProviderHealth[];
+    }
+
+    forceLocal(active: boolean = true): { success: boolean; message: string } {
+        const local = this._findLocalProvider();
+
+        if (active && !local) {
+            return {
+                success: false,
+                message: 'Aucune instance Ollama locale enregistrée. Lancez Ollama sur http://localhost:11434.',
+            };
+        }
+
+        this._forcedLocalActive = active;
+        this._stats.forcedLocalActive = active;
+        this._syncStats();
+
+        return {
+            success: true,
+            message: active
+                ? `⚡ Mode local forcé — tout le trafic est routé vers ${local!.name}.`
+                : '☁️ Mode local désactivé — routage automatique rétabli.',
+        };
+    }
+
+    isForcedLocal(): boolean {
+        return this._forcedLocalActive;
+    }
+
+    triggerFailover(url: string, cooldownMs = SUSPENSION_THRESHOLD_MS): ProviderHealth | null {
+        const h = this._health.get(this._urlKey(url));
+        if (!h) return null;
+
+        h.rateLimitedUntil = Date.now() + cooldownMs;
+        this._checkSuspension(h, cooldownMs);
+
+        return this._findBestFailover(h.provider);
+    }
+
+    private _findLocalProvider(): ProviderHealth | undefined {
+        return Array.from(this._health.values()).find(h => h.provider === 'local');
+    }
+
+    private _findBestFailover(excludeProvider: string): ProviderHealth | null {
+        const now = Date.now();
+        const available = Array.from(this._health.values()).filter(h =>
+            !h.suspended &&
+            h.available &&
+            h.rateLimitedUntil <= now &&
+            h.provider !== excludeProvider
+        );
+
+        for (const priority of FAILOVER_PRIORITY) {
+            const match = available.find(h => h.provider === priority);
+            if (match) return match;
+        }
+
+        if (available.length > 0) {
+            return available.sort((a, b) => this._score(b, 'chat') - this._score(a, 'chat'))[0];
+        }
+
+        return null;
+    }
+
 
     getBestFreeModel(providerKey: string): string | null {
         const models = FREE_MODELS[providerKey];
@@ -196,6 +347,42 @@ export class ProviderRouter {
     supportsVision(url: string): boolean {
         return this.getCapabilities(url)?.vision ?? false;
     }
+
+    onStatsChanged(cb: (stats: RouterStats) => void) {
+        this._onStatsChanged = cb;
+    }
+
+    onProviderSuspended(cb: (event: ProviderSuspendedEvent) => void) {
+        this._onProviderSuspended = cb;
+    }
+
+    getStats(): RouterStats {
+        return { ...this._stats };
+    }
+
+    getProviderHealth(url: string): ProviderHealth | undefined {
+        return this._health.get(this._urlKey(url));
+    }
+
+    getAllHealth(): ProviderHealth[] {
+        return Array.from(this._health.values());
+    }
+
+    getCooldownSummary(): string {
+        const now = Date.now();
+        const cooled = Array.from(this._health.values())
+            .filter(h => h.rateLimitedUntil > now)
+            .map(h => {
+                const remainMs = h.rateLimitedUntil - now;
+                const label = h.suspended ? '🔴 suspendu' : '🟡 cooldown';
+                const time = remainMs >= 3_600_000
+                    ? `${Math.ceil(remainMs / 3_600_000)}h`
+                    : `${Math.ceil(remainMs / 1000)}s`;
+                return `${h.name}: ${time} (${label})`;
+            });
+        return cooled.length > 0 ? cooled.join(', ') : 'Aucun cooldown actif';
+    }
+
 
     private _enqueueRequest(task: TaskType, requireVision: boolean): Promise<string> {
         return new Promise((resolve, reject) => {
@@ -232,7 +419,7 @@ export class ProviderRouter {
         }
         const now = Date.now();
         const available = Array.from(this._health.values())
-            .filter(h => h.available && h.rateLimitedUntil <= now);
+            .filter(h => h.available && !h.suspended && h.rateLimitedUntil <= now);
 
         if (available.length === 0) return;
 
@@ -245,40 +432,6 @@ export class ProviderRouter {
         }
     }
 
-    onStatsChanged(cb: (stats: RouterStats) => void) {
-        this._onStatsChanged = cb;
-    }
-
-    getStats(): RouterStats {
-        return { ...this._stats };
-    }
-
-    getProviderHealth(url: string): ProviderHealth | undefined {
-        return this._health.get(this._urlKey(url));
-    }
-
-    getAllHealth(): ProviderHealth[] {
-        return Array.from(this._health.values());
-    }
-
-    getCooldownSummary(): string {
-        const now = Date.now();
-        const cooled = Array.from(this._health.values())
-            .filter(h => h.rateLimitedUntil > now)
-            .map(h => `${h.name}: ${Math.ceil((h.rateLimitedUntil - now) / 1000)}s`);
-        return cooled.length > 0 ? cooled.join(', ') : 'Aucun cooldown actif';
-    }
-
-    private _syncStats() {
-        this._stats.providers = Array.from(this._health.values());
-        this._stats.queueLength = this._queue.length;
-        this._stats.lastUpdated = Date.now();
-        this._onStatsChanged?.(this.getStats());
-    }
-
-    private _urlKey(url: string): string {
-        return (url || '').replace(/\/+$/, '').toLowerCase();
-    }
 
     async pingProvider(url: string, apiKey?: string): Promise<{ ok: boolean; latencyMs: number }> {
         const t0 = Date.now();
@@ -294,7 +447,12 @@ export class ProviderRouter {
             const h = this._health.get(this._urlKey(url));
             if (h) {
                 h.latencyMs = latencyMs;
-                h.available = res.ok;
+                if (res.ok && !h.suspended) h.available = true;
+                if (res.ok && h.suspended) {
+                    h.suspended = false;
+                    h.rateLimitedUntil = 0;
+                    h.available = true;
+                }
                 h.lastChecked = Date.now();
                 this._syncStats();
             }
@@ -304,6 +462,18 @@ export class ProviderRouter {
             if (h) { h.available = false; h.lastChecked = Date.now(); this._syncStats(); }
             return { ok: false, latencyMs: Date.now() - t0 };
         }
+    }
+
+    private _syncStats() {
+        this._stats.providers = Array.from(this._health.values());
+        this._stats.queueLength = this._queue.length;
+        this._stats.lastUpdated = Date.now();
+        this._stats.forcedLocalActive = this._forcedLocalActive;
+        this._onStatsChanged?.(this.getStats());
+    }
+
+    private _urlKey(url: string): string {
+        return (url || '').replace(/\/+$/, '').toLowerCase();
     }
 
     dispose() {
